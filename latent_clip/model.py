@@ -1,5 +1,5 @@
 # [Imports remain the same as the previous refactored version]
-from transformers import CLIPProcessor, CLIPModel
+from transformers import CLIPProcessor, CLIPModel, CLIPConfig
 from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.models.clip.configuration_clip import CLIPTextConfig, CLIPVisionConfig
 import torch
@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 from typing import Optional, Tuple
+from mmdit.mmdit_generalized_pytorch import MMDiT
 
 
 # [contrastive_loss and clip_loss functions remain the same]
@@ -21,54 +22,28 @@ def clip_loss(similarity: torch.Tensor) -> torch.Tensor:
 
 
 class LatentEmbedder(nn.Module):
-    """
-    Transforms a sequence of token embeddings of arbitrary length into a
-    fixed number of 'latent' register token embeddings via self-attention,
-    respecting the provided attention mask for the input sequence.
-    Implements a single Transformer block (Self-Attention + MLP).
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        n_register_tokens: int,
-    ):
-        """
-        Args:
-            hidden_size: Dimensionality of the input and output embeddings.
-            intermediate_size: Dimensionality of the MLP's hidden layer.
-            n_register_tokens: The fixed number of latent output tokens.
-        """
+    def __init__(self, hidden_size: int, n_register_tokens: int, n_layers: int = 1):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.n_register_tokens = n_register_tokens
-
         self.register_embeds = nn.Parameter(
-            torch.randn(n_register_tokens, hidden_size) * (hidden_size**-0.5)
-        )
-        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.ln_1 = nn.LayerNorm(hidden_size)
-        self.ln_2 = nn.LayerNorm(hidden_size)
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_size, intermediate_size),
-            nn.GELU(),
-            nn.Linear(intermediate_size, hidden_size),
+            torch.randn(n_register_tokens, hidden_size) * 0.02
         )
 
-    def forward(
-        self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+        self.blocks = MMDiT(
+            depth=n_layers,
+            dim_modalities=[hidden_size, hidden_size],
+            dim_cond=256,
+        )
+        self.n_register_tokens = n_register_tokens
+        self.hidden_size = hidden_size
+        self.meta_tensor_projector = nn.Linear(2, 256, bias=False)
+        self.meta_tensor_projector.weight.data.normal_(0, 0.02)
+
+    def forward(self, x, attention_mask, meta_tensor=None):
         """
         Forward pass of the LatentEmbedder.
 
         Args:
             x: Input token embeddings tensor of shape (B, T_txt, D).
-            attention_mask: Optional tensor of shape (B, T_txt) where 1 indicates
-                            a real token and 0 indicates padding. This mask is
-                            used to prevent attention to padding tokens in `x`.
 
         Returns:
             A tensor containing the final states of the register tokens,
@@ -76,42 +51,18 @@ class LatentEmbedder(nn.Module):
         """
         B, T_txt, D = x.shape
         device = x.device
+        cond = self.meta_tensor_projector(meta_tensor)
+        # --- Register Token Embedding ---
+        y = self.register_embeds.expand(B, -1, -1).to(device)
 
-        # Add register tokens to the input sequence
-        registers = self.register_embeds.unsqueeze(0).expand(B, -1, -1)
-        x_with_registers = torch.cat([x, registers], dim=1)
-        # Shape becomes (B, T_combined, D) where T_combined = T_txt + n_register_tokens
-        # --- Start Transformer Block ---
-        q = self.q_proj(x_with_registers)
-        k = self.k_proj(x_with_registers)
-        v = self.v_proj(x_with_registers)
-
-        # --- Prepare Attention Mask ---
-        register_mask = torch.ones(
-            (B, self.n_register_tokens), dtype=attention_mask.dtype, device=device
-        )
-        combined_mask_1d = torch.cat([attention_mask, register_mask], dim=1)
-        combined_mask_2d = combined_mask_1d.unsqueeze(1) * combined_mask_1d.unsqueeze(2)
-        combined_mask_2d = combined_mask_2d.bool()
-        # Apply scaled dot-product attention with the generated mask
-        attn_output = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=combined_mask_2d,  # Use the generated boolean mask
-            dropout_p=0.0,
-            is_causal=False,  # We are doing bidirectional self-attention
+        x, y = self.blocks(
+            modality_tokens=(x, y),
+            modality_masks=(attention_mask, None),
+            time_cond=cond,
         )
 
-        x = self.ln_1(attn_output + x_with_registers)
-        mlp_output = self.mlp(x)
-        x = self.ln_2(mlp_output + x)
-        # --- End Transformer Block ---
-
-        # Extract only the embeddings corresponding to the register tokens
-        output_embeds = x[:, -self.n_register_tokens :, :]
-
-        return output_embeds
+        # --- Extract Register Tokens ---
+        return y
 
 
 class LatentClip(nn.Module):
@@ -124,19 +75,15 @@ class LatentClip(nn.Module):
     def __init__(
         self,
         pretrained_clip_id: str = "openai/clip-vit-base-patch32",
-        latent_embedder_layers: int = 1,
-        pool_loss_weight: float = 0.8,
-        position_loss_weight: float = 0.2,
+        n_register_layers: int = 12,
     ):
         """
         [Init docstring remains the same]
         """
         super().__init__()
         print(f"Initializing LatentClip with {pretrained_clip_id}")
-
-        self.pool_loss_weight = pool_loss_weight
-        self.position_loss_weight = position_loss_weight
-
+        # config = CLIPConfig.from_pretrained(pretrained_clip_id)
+        # self.model = CLIPModel(config)
         self.model = CLIPModel.from_pretrained(pretrained_clip_id)
         self.processor = CLIPProcessor.from_pretrained(pretrained_clip_id)
         self.text_config: CLIPTextConfig = self.model.config.text_config
@@ -159,9 +106,10 @@ class LatentClip(nn.Module):
 
         self.latent_embedder = LatentEmbedder(
             hidden_size=self.text_config.hidden_size,
-            intermediate_size=self.text_config.intermediate_size,
             n_register_tokens=n_patch_tokens,
+            n_layers=n_register_layers,
         )
+        self.patch_logit_scale = nn.Parameter(torch.zeros((n_patch_tokens,)))
         self.latent_proj = nn.Linear(
             self.text_config.hidden_size, self.image_config.hidden_size, bias=False
         )
@@ -177,6 +125,7 @@ class LatentClip(nn.Module):
         output_attentions: Optional[bool] = False,
         output_hidden_states: Optional[bool] = True,
         interpolate_pos_encoding: bool = False,
+        meta_tensor: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         [Forward docstring remains the same, but note attention_mask importance]
@@ -207,33 +156,18 @@ class LatentClip(nn.Module):
             output_hidden_states=True,
         )
 
-        # 2. Global Contrastive Loss (Standard CLIP)
-        # [This section remains the same]
         image_embeds_pooled = vision_outputs.pooler_output
         image_embeds_pooled = self.model.visual_projection(image_embeds_pooled)
-        text_embeds_pooled = text_outputs.pooler_output
-        text_embeds_pooled = self.model.text_projection(text_embeds_pooled)
 
         image_embeds_pooled_norm = image_embeds_pooled / torch.linalg.vector_norm(
             image_embeds_pooled, dim=-1, keepdim=True, ord=2
         )
-        text_embeds_pooled_norm = text_embeds_pooled / torch.linalg.vector_norm(
-            text_embeds_pooled, dim=-1, keepdim=True, ord=2
-        )
-
-        logit_scale = self.model.logit_scale.exp().to(text_embeds_pooled_norm.device)
-        logits_per_text_pooled = (
-            torch.matmul(text_embeds_pooled_norm, image_embeds_pooled_norm.t())
-            * logit_scale
-        )
-
-        pool_loss = clip_loss(logits_per_text_pooled)
-
-        # 3. Positional Contrastive Loss
-        text_hidden_states = text_outputs.last_hidden_state  # (B, T_txt, D_txt)
         vision_hidden_states = (
             vision_outputs.last_hidden_state
         )  # (B, 1 + N_p, D_img) or (B, N_p, D_img)
+
+        # 3. Positional Contrastive Loss
+        text_hidden_states = text_outputs.last_hidden_state  # (B, T_txt, D_txt)
 
         # --- Extract patch embeddings [Remains the same] ---
         if vision_hidden_states.shape[1] == self.latent_embedder.n_register_tokens + 1:
@@ -245,12 +179,10 @@ class LatentClip(nn.Module):
                 f"Vision hidden state seq len ({vision_hidden_states.shape[1]}) "
                 f"mismatch with expected patches ({self.latent_embedder.n_register_tokens})."
             )
-
-        # --- Generate latent text embeddings, PASSING the attention_mask ---
-        # Input: (B, T_txt, D_txt), Output: (B, N_p, D_txt)
         latent_text_hidden_states = self.latent_embedder(
             text_hidden_states,
-            attention_mask=attention_mask,  # Pass the original text mask here
+            attention_mask=attention_mask.bool(),
+            meta_tensor=meta_tensor,
         )
         latent_text_hidden_states = self.latent_proj(latent_text_hidden_states)
 
@@ -261,7 +193,6 @@ class LatentClip(nn.Module):
                 f"vs Vision Patch {vision_patch_hidden_states.shape}"
             )
 
-        # --- Normalize and Calculate Positional Similarities [Remains the same] ---
         B, N, D = latent_text_hidden_states.shape
         latent_text_norm = latent_text_hidden_states / torch.linalg.vector_norm(
             latent_text_hidden_states, dim=-1, keepdim=True, ord=2
@@ -272,35 +203,17 @@ class LatentClip(nn.Module):
 
         t_permuted = latent_text_norm.permute(1, 0, 2)
         v_permuted_t = vision_patch_norm.permute(1, 2, 0)
-        positional_logits = (
-            torch.bmm(t_permuted, v_permuted_t) * logit_scale
-        )  # Shape: (N, B, B)
 
         # Calculate clip_loss per position and average [Remains the same]
         positional_losses = []
         for i in range(N):
-            logits_i = positional_logits[i, :, :]
+            logit_scale_i = self.patch_logit_scale[i].exp()
+            logits_i = torch.matmul(t_permuted[i], v_permuted_t[i]) * logit_scale_i
             loss_i = clip_loss(logits_i)
             positional_losses.append(loss_i)
         position_clip_loss = torch.stack(positional_losses).mean()
 
-        # 4. Combine Losses [Remains the same]
-        total_loss = (
-            self.pool_loss_weight * pool_loss
-            + self.position_loss_weight * position_clip_loss
-        )
-
-        # Return dummy losses if not required (e.g., during inference)
-        if not return_loss:
-            # Return NaNs or zeros if loss not computed
-            total_loss = torch.tensor(float("nan"), device=pool_loss.device)
-            pool_loss = torch.tensor(float("nan"), device=pool_loss.device)
-            position_clip_loss = torch.tensor(
-                float("nan"), device=position_clip_loss.device
-            )
-            # Or consider returning embeddings instead in a different output format
-
-        return total_loss, pool_loss, position_clip_loss
+        return position_clip_loss
 
 
 # --- Example Usage (Basic Test) ---

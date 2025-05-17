@@ -8,3 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+
+lightning_logs
+wandb
+.ruff_cache
