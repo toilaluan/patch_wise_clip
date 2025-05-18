@@ -7,6 +7,7 @@ requires-python = ">=3.11"
 dependencies = [
     "datasets>=3.6.0",
     "diffusers>=0.33.1",
+    "fairscale>=0.4.13",
     "lightning>=2.5.1.post0",
     "mmdit>=0.2.2",
     "ruff>=0.11.8",
@@ -14,4 +15,5 @@ dependencies = [
     "torchtune>=0.6.1",
     "transformers>=4.51.3",
     "wandb>=0.19.11",
+    "x-transformers>=2.3.5",
 ]

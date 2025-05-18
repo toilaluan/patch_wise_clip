@@ -299,6 +299,16 @@ wheels = [
 ]
 
 [[package]]
+name = "fairscale"
+version = "0.4.13"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "torch" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c1/08/b3334d7b543ac10dcb129cef4f84723ab696725512f18d69ab3a784b0bf5/fairscale-0.4.13.tar.gz", hash = "sha256:1b797825c427f5dba92253fd0d8daa574e8bd651a2423497775fab1b30cfb768", size = 266261, upload_time = "2022-12-11T18:09:16.892Z" }
+
+[[package]]
 name = "filelock"
 version = "3.18.0"
 source = { registry = "https://pypi.org/simple" }
@@ -314,6 +324,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "datasets" },
     { name = "diffusers" },
+    { name = "fairscale" },
     { name = "lightning" },
     { name = "mmdit" },
     { name = "ruff" },
@@ -321,12 +332,14 @@ dependencies = [
     { name = "torchtune" },
     { name = "transformers" },
     { name = "wandb" },
+    { name = "x-transformers" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "datasets", specifier = ">=3.6.0" },
     { name = "diffusers", specifier = ">=0.33.1" },
+    { name = "fairscale", specifier = ">=0.4.13" },
     { name = "lightning", specifier = ">=2.5.1.post0" },
     { name = "mmdit", specifier = ">=0.2.2" },
     { name = "ruff", specifier = ">=0.11.8" },
@@ -334,6 +347,7 @@ requires-dist = [
     { name = "torchtune", specifier = ">=0.6.1" },
     { name = "transformers", specifier = ">=4.51.3" },
     { name = "wandb", specifier = ">=0.19.11" },
+    { name = "x-transformers", specifier = ">=2.3.5" },
 ]
 
 [[package]]
