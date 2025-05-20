@@ -110,10 +110,10 @@ trainer = L.Trainer(
         LearningRateMonitor(logging_interval="step"),
         ModelCheckpoint(
             dirpath=f"checkpoints/{args.pretrained_clip_id.split('/')[-1]}/{args.n_register_encoder_layers}-{args.loss_weights}",
-            filename="best-{epoch:02d}-{val_imagenet_acc:.2f}",
+            filename="best-{epoch:02d}-{val_acc_global:.2f}",
             save_last=True,
             save_top_k=3,
-            monitor="val_imagenet_acc",
+            monitor="val_acc_global",
             mode="max",
             every_n_epochs=1,
         ),
