@@ -6,6 +6,14 @@ import random
 import torch
 import math
 
+with open("imagenet_map.txt", "r") as f:
+    imagenet_map = f.read().splitlines()
+    imagenet_map = [line.split(" ", maxsplit=1) for line in imagenet_map]
+
+print(imagenet_map)
+
+imagenet_map = {line[0]: line[1] for line in imagenet_map}
+
 
 class ClipDataset(Dataset):
     def __init__(self, pretrained_clip_id: str, is_train=True):
@@ -46,7 +54,7 @@ class ClipDataset(Dataset):
 
 class ImageNetDataset(Dataset):
     def __init__(self, processor: CLIPImageProcessor):
-        self.ds = load_dataset("frgfm/imagenette", "320px", split="validation")
+        self.ds = load_dataset("mrm8488/ImageNet1K-val", split="train")
         self.processor = processor
         self.target_size = self.processor.image_processor.size["shortest_edge"]
         self.texts, self.labels = self.get_texts_labels()
@@ -58,6 +66,8 @@ class ImageNetDataset(Dataset):
         labels = []
         texts = []
         texts = self.ds.features["label"].names
+        texts = [imagenet_map[t] for t in texts]
+        print(texts[:10])
         labels = list(range(len(texts)))
         return texts, labels
 
@@ -82,13 +92,17 @@ class ImageNetDataset(Dataset):
         # out: {'pixel_values': (num_classes, 3, 224, 224), 'input_ids': (num_classes, 77), ...}
         # For images, pixel_values is repeated per class. We'll use only the first copy.
         for k, v in out.items():
-            out[k] = v.squeeze(0) if v.dim() == 3 else v  # (num_classes, ...) or (num_classes, 77)
+            out[k] = (
+                v.squeeze(0) if v.dim() == 3 else v
+            )  # (num_classes, ...) or (num_classes, 77)
         return {
-            "pixel_values": out["pixel_values"][0],  # use only first (since image repeats)
-            "input_ids_all": out["input_ids"],       # (num_classes, 77)
+            "pixel_values": out["pixel_values"][
+                0
+            ],  # use only first (since image repeats)
+            "input_ids_all": out["input_ids"],  # (num_classes, 77)
             "attention_mask_all": out["attention_mask"],  # (num_classes, 77)
             "meta_tensor": torch.tensor([ratio, scale]),
-            "label": label
+            "label": label,
         }
 
 

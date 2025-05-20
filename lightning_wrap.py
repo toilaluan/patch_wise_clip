@@ -1,11 +1,10 @@
 import torch
 import lightning as L
-from latent_clip.model import LatentCLIP
-from transformers.optimization import get_cosine_schedule_with_warmup
+from latent_clip.model import PatchWiseCLIP
 
+POOL_W = 0.6
+PATCH_W = 0.4
 
-POOL_W = 0.8
-PATCH_W = 0.2
 
 class WrapPatchWiseClip(L.LightningModule):
     def __init__(
@@ -13,82 +12,87 @@ class WrapPatchWiseClip(L.LightningModule):
         pretrained_clip_id: str = "openai/clip-vit-base-patch32",
         learning_rate: float = 1e-4,
         weight_decay: float = 1e-5,
-        total_steps: int = 100000,
-        warmup_steps: int = 1000,
-        n_latent_layers: int = 0,
+        n_register_encoder_layers: int = 0,
+        loss_weights: tuple = (POOL_W, PATCH_W),
     ):
         super().__init__()
-        self.latent_clip = LatentCLIP(pretrained_clip_id, latent_layers=n_latent_layers)
-        self.total_steps = total_steps
-        self.warmup_steps = warmup_steps
-        self.learning_rate = learning_rate
-        self.weight_decay = weight_decay
+        self.clip = PatchWiseCLIP(pretrained_clip_id, latent_layers=n_register_encoder_layers)
+        self.lr = learning_rate
+        self.wd = weight_decay
+        self.loss_w = loss_weights
+        self.save_hyperparameters("learning_rate", "weight_decay", "n_register_encoder_layers", "loss_weights")
+
+    # ------------------------------ train ---------------------------------- #
 
     def forward(self, *args, **kwargs):
-        return self.latent_clip(*args, **kwargs)
+        return self.clip(*args, **kwargs)
 
-    def training_step(self, batch, batch_idx):
-        pool_loss, patch_loss = self.forward(**batch, return_loss=True)
-        combined_loss = pool_loss * POOL_W + patch_loss * PATCH_W
-        self.log(
-            "train/total_loss", combined_loss, on_step=True, on_epoch=True, prog_bar=True
-        )
-        self.log("train/pool_loss", pool_loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log("train/patch_loss", patch_loss, on_step=True, on_epoch=True, prog_bar=True)
-        return combined_loss
+    def training_step(self, batch, _):
+        pool_loss, patch_loss = self(**batch, return_loss=True)
+        total = pool_loss * self.loss_w[0] + patch_loss * self.loss_w[1]
+        self.log_dict({
+            "train/total": total,
+            "train/pool": pool_loss,
+            "train/patch": patch_loss,
+        }, on_step=True, on_epoch=True, prog_bar=True)
+        return total
 
-    def validation_step(self, batch, batch_idx):
-        # For ImageNetDataset: batch is a dict, each key: batch_size
-        # batch["pixel_values"]: (B, 3, H, W)
-        # batch["input_ids_all"]: (B, num_classes, 77)
-        # batch["attention_mask_all"]: (B, num_classes, 77)
-        # batch["label"]: (B,)
+    # ----------------------------- validation ------------------------------ #
 
-        pixel_values = batch["pixel_values"]        # (B, 3, H, W)
+    @torch.no_grad()
+    def validation_step(self, batch, _):
+        pixel_values = batch["pixel_values"]  # (B, 3, H, W)
+        labels = batch["label"]
         meta_tensor = batch.get("meta_tensor", None)
-        labels = batch["label"]                     # (B,)
+        num_cls = batch["input_ids_all"].shape[1]
 
-        # 1. Compute image pooled features
-        img_pool, _ = self.latent_clip.encode_image(pixel_values)
+        img_pool, img_patch = self.clip.encode_image(pixel_values)
+        all_global, all_patch = [], []  # logits for each image
 
-        # 2. For each image in batch, get all candidate text features (num_classes, 77)
-        num_classes = batch["input_ids_all"].shape[1]
-        all_logits = []
         for i in range(pixel_values.size(0)):
-            input_ids = batch["input_ids_all"][i]             # (num_classes, 77)
-            attention_mask = batch["attention_mask_all"][i]   # (num_classes, 77)
+            input_ids = batch["input_ids_all"][i]
+            attention_mask = batch["attention_mask_all"][i]
             meta = meta_tensor[i] if meta_tensor is not None else None
 
-            # Text features for all classes
-            txt_pool, _ = self.latent_clip.encode_text(
+            txt_pool, txt_latent = self.clip.encode_text(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                meta=meta.expand(num_classes, -1) if meta is not None else None
-            )  # (num_classes, D)``
+                meta=meta.expand(num_cls, -1) if meta is not None else None,
+            )
 
-            # Compute similarity to current image
-            logits = img_pool[i].unsqueeze(0) @ txt_pool.t() * self.latent_clip.model.logit_scale.exp()  # (1, num_classes)
-            all_logits.append(logits.squeeze(0))  # (num_classes,)
+            # global similarity
+            g_log = (img_pool[i].unsqueeze(0) @ txt_pool.t()) * self.clip.model.logit_scale.exp()  # (1, num_cls)
+            all_global.append(g_log.squeeze(0))
 
-        logits = torch.stack(all_logits, dim=0)  # (B, num_classes)
-        preds = logits.argmax(dim=-1)            # (B,)
-        acc = (preds == labels).float().mean()
+            # patch similarity (if available)
+            if txt_latent is not None:
+                scale = self.clip.patch_logit_s.exp()
+                p_sim = (img_patch[i].unsqueeze(0) * txt_latent).sum(-1) * scale  # (num_cls, N)
+                all_patch.append(p_sim.sum(-1))  # (num_cls,)
+            else:
+                all_patch.append(torch.zeros(num_cls, device=self.device))
 
-        self.log("val/imagenet_acc", acc, on_epoch=True, prog_bar=True)
+        global_logits = torch.stack(all_global)  # (B, num_cls)
+        patch_logits = torch.stack(all_patch)    # (B, num_cls)
+        combined_logits = global_logits + patch_logits
 
-        # Optionally, return accuracy and loss for aggregation
-        return {"acc": acc}
+        preds_global = global_logits.argmax(-1)
+        preds_comb = combined_logits.argmax(-1)
+        preds_patch = patch_logits.argmax(-1)
 
+        acc_global = (preds_global == labels).float().mean()
+        acc_comb = (preds_comb == labels).float().mean()
+        acc_patch = (preds_patch == labels).float().mean()
+
+        self.log_dict({
+            "val_imagenet_acc": acc_global,
+            "val/acc_combined": acc_comb,
+            "val/acc_patch": acc_patch,
+        }, on_epoch=True, prog_bar=True)
+        return {"acc_global": acc_global, "acc_combined": acc_comb}
+
+    # ---------------------------- optimisers ------------------------------- #
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(
-            [p for p in self.parameters() if p.requires_grad],
-            lr=self.learning_rate,
-            weight_decay=self.weight_decay,
-        )
-        # scheduler = get_cosine_schedule_with_warmup(
-        #     optimizer,
-        #     num_warmup_steps=self.warmup_steps,
-        #     num_training_steps=self.total_steps,
-        # )
-        return optimizer
+        opt = torch.optim.AdamW((p for p in self.parameters() if p.requires_grad), lr=self.lr, weight_decay=self.wd)
+        return opt
