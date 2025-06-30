@@ -1,12 +1,10 @@
-# ----------------------------------------------
-# model_wrap.py
-# ----------------------------------------------
 import torch, lightning as L
-from latent_clip.model import PatchWiseCLIP
+from patch_wise_clip.model import PatchWiseCLIP
 from transformers import CLIPProcessor
 
 POOL_W = 0.6
 PATCH_W = 0.4
+CTF_W = 0.0
 
 
 class WrapPatchWiseClip(L.LightningModule):
@@ -15,12 +13,14 @@ class WrapPatchWiseClip(L.LightningModule):
         pretrained_clip_id: str = "openai/clip-vit-base-patch32",
         learning_rate: float = 1e-4,
         weight_decay: float = 1e-5,
-        n_register_encoder_layers: int = 0,
-        loss_weights: tuple = (POOL_W, PATCH_W),
+        n_text_compressing_layers: int = 0,
+        loss_weights: tuple = (POOL_W, PATCH_W, CTF_W),
+        hf_output_id: str = "toilaluan/patch-wise-clip",
     ):
         super().__init__()
+        self.hf_output_id = hf_output_id + f"-{n_text_compressing_layers}clayers-{loss_weights[0]}pool-{loss_weights[1]}patch"
         self.clip = PatchWiseCLIP(
-            pretrained_clip_id, latent_layers=n_register_encoder_layers
+            pretrained_clip_id, text_compressing_layers=n_text_compressing_layers
         )
         self.processor = CLIPProcessor.from_pretrained(pretrained_clip_id)
         self.lr, self.wd, self.loss_w = learning_rate, weight_decay, loss_weights
@@ -30,8 +30,9 @@ class WrapPatchWiseClip(L.LightningModule):
         self.register_buffer("txt_latent", torch.empty(0), persistent=False)
 
         self.save_hyperparameters(
-            "learning_rate", "weight_decay", "n_register_encoder_layers", "loss_weights"
+            "learning_rate", "weight_decay", "n_text_compressing_layers", "loss_weights"
         )
+        self.best_val_acc = 0.0
 
     # ---------- text cache --------------------------------------------------
     def setup(self, stage: str) -> None:
@@ -60,21 +61,22 @@ class WrapPatchWiseClip(L.LightningModule):
         self.txt_latent = (
             torch.nn.functional.normalize(txt_latent, dim=-1) if txt_latent is not None else None
         )
+        print(f"Will be pushing to {self.hf_output_id}")
+        print(f"txt_pool shape: {self.txt_pool.shape}")
+        print(f"txt_latent shape: {self.txt_latent.shape}")
 
-        print(self.txt_pool.shape, self.txt_latent.shape)
-
-    # ---------- train (unchanged) ------------------------------------------
     def forward(self, *a, **kw):
         return self.clip(*a, **kw)
 
     def training_step(self, batch, _):
-        pool_loss, patch_loss = self(**batch, return_loss=True)
-        total = pool_loss * self.loss_w[0] + patch_loss * self.loss_w[1]
+        pool_loss, patch_loss, ctf_loss = self(**batch, return_loss=True)
+        total = pool_loss * self.loss_w[0] + patch_loss * self.loss_w[1] + ctf_loss * self.loss_w[2]
         self.log_dict(
             {
                 "train/total": total,
                 "train/pool": pool_loss,
                 "train/patch": patch_loss,
+                "train/ctf": ctf_loss,
             },
             on_step=True,
             on_epoch=True,
@@ -84,10 +86,7 @@ class WrapPatchWiseClip(L.LightningModule):
 
     # ---------- fast validation --------------------------------------------
     def on_validation_epoch_start(self):
-        # Set model to eval mode
         self.clip.eval()
-
-        # Set up text cache
         if self.txt_pool.shape[0] == 0:
             self.setup("validate")
 
@@ -97,20 +96,14 @@ class WrapPatchWiseClip(L.LightningModule):
 
         # global logits
         scale = self.clip.model.logit_scale.exp()
-        global_logits = img_pool @ self.txt_pool.T * scale          # (B, 1000)
+        global_logits = img_pool @ self.txt_pool.T * scale
 
         # patch logits
         if self.txt_latent is not None:
-            patch_scale = self.clip.patch_logit_s.exp()
-            # img_patch: (B, N, D)  txt_latent: (1000, N, D)
-            # einsum -> (B, 1000, N)  →  sum over N  →  (B, 1000)
-            # print(img_patch.shape, self.txt_latent.shape)
-            # print(img_patch, img_patch.shape)
-            # print(self.txt_latent, self.txt_latent.shape)
+            # patch_scale = self.clip.patch_logit_s.exp() # Dont need scale for argmax
             patch_logits = (
                 torch.einsum("bnd,knd->bk", img_patch, self.txt_latent)
             )
-            # print(patch_logits)
         else:
             patch_logits = torch.zeros_like(global_logits)
 
@@ -130,6 +123,13 @@ class WrapPatchWiseClip(L.LightningModule):
             on_epoch=True,
             prog_bar=True,
         )
+        return (preds_c == labels).float().mean()
+    
+    def on_validation_epoch_end(self, outputs):
+        acc = torch.stack(outputs).mean()
+        if acc > self.best_val_acc:
+            self.best_val_acc = acc
+            self.clip.model.push_to_hub(self.hf_output_id)
 
     # ---------- optim ------------------------------------------------------
     def configure_optimizers(self):

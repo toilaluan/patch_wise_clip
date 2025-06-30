@@ -4,7 +4,6 @@ import torch.nn.functional as F
 import lightning as L
 from transformers import CLIPModel, CLIPProcessor, CLIPConfig
 from mmdit.mmdit_generalized_pytorch import MMDiT
-from x_transformers import CrossAttender  # noqa: F401 – optional cross‑modal attention
 
 
 # ───────────────────────── loss helpers ────────────────────────── #
@@ -20,8 +19,8 @@ def clip_loss(sim: torch.Tensor) -> torch.Tensor:
 
 # ───────────────────────── building blocks ─────────────────────── #
 
-class LatentEmbedder(nn.Module):
-    """Registers‑as‑tokens encoder (text → latent patch‑tokens)."""
+class TokenCompressor(nn.Module):
+    """Registers‑as‑tokens encoder (text + registers → patch‑tokens)."""
 
     def __init__(self, hidden: int, img_hidden: int, n_tokens: int, layers: int = 1):
         super().__init__()
@@ -49,26 +48,26 @@ class LatentEmbedder(nn.Module):
 class PatchWiseCLIP(nn.Module):
     """CLIP variant with optional patch‑wise alignment."""
 
-    def __init__(self, clip_id: str = "openai/clip-vit-base-patch32", latent_layers: int = 0):
+    def __init__(self, clip_id: str = "openai/clip-vit-base-patch32", text_compressing_layers: int = 0):
         super().__init__()
         cfg = CLIPConfig.from_pretrained(clip_id)
         self.model = CLIPModel(cfg)
         self.proc = CLIPProcessor.from_pretrained(clip_id)
-        self.latent_layers = latent_layers
+        self.text_compressing_layers = text_compressing_layers
 
-        if latent_layers > 0:
+        if text_compressing_layers > 0:
             v_cfg = self.model.config.vision_config
             grid = v_cfg.image_size // v_cfg.patch_size
             n_patches = grid * grid
-            self.latent = LatentEmbedder(
+            self.token_compressor = TokenCompressor(
                 hidden=self.model.config.text_config.hidden_size,
                 img_hidden=v_cfg.hidden_size,
                 n_tokens=n_patches,
-                layers=latent_layers,
+                layers=text_compressing_layers,
             )
             self.patch_logit_s = nn.Parameter(torch.zeros(n_patches))
         else:
-            self.latent = None
+            self.token_compressor = None
             self.patch_logit_s = None
 
     # ------------------------------- encoders ------------------------------ #
@@ -88,38 +87,40 @@ class PatchWiseCLIP(nn.Module):
         )
         pooled = F.normalize(self.model.text_projection(out.pooler_output), dim=-1)
 
-        if self.latent_layers > 0:
+        if self.text_compressing_layers > 0:
             meta = meta if meta is not None else torch.zeros(len(input_ids), 2, device=input_ids.device)
-            latents = self.latent(out.last_hidden_state, mask=attention_mask.bool(), meta=meta)
+            compressed_text_features = self.token_compressor(out.last_hidden_state, mask=attention_mask.bool(), meta=meta)
         else:
-            latents = None
-        return pooled, latents  # (B, D), (B, N, D)|None
+            compressed_text_features = None
+        return pooled, compressed_text_features  # (B, D), (B, N, D)|None
 
     # ------------------------------- loss ---------------------------------- #
 
-    def compute_loss(self, img_pool, txt_pool, img_patch=None, txt_latent=None):
+    def compute_loss(self, img_pool, txt_pool, img_patch=None, compressed_text_features=None):
         global_logits = img_pool @ txt_pool.t() * self.model.logit_scale.exp()
         pool_loss = clip_loss(global_logits)
 
-        if img_patch is None or txt_latent is None:
+        if img_patch is None or compressed_text_features is None:
             return pool_loss, torch.tensor(0.0, device=img_pool.device)
 
         scale = self.patch_logit_s.exp()  # (N,)
-        patch_sim = (img_patch.unsqueeze(1) * txt_latent.unsqueeze(0)).sum(-1) * scale  # (B_img, B_txt, N)
+        patch_sim = (img_patch.unsqueeze(1) * compressed_text_features.unsqueeze(0)).sum(-1) * scale  # (B_img, B_txt, N)
         patch_logits = patch_sim.sum(-1)  # aggregate over patches → (B_img, B_txt)
         patch_loss = clip_loss(patch_logits)
-        return pool_loss, patch_loss
+        ctf_sim = (compressed_text_features.unsqueeze(1) * compressed_text_features.unsqueeze(0)).sum(-1)
+        ctf_loss = clip_loss(ctf_sim)
+        return pool_loss, patch_loss, ctf_loss
 
     # ------------------------------- forward -------------------------------- #
 
     def forward(self, *, input_ids, pixel_values, attention_mask=None, position_ids=None, meta_tensor=None, return_loss=False):
         img_pool, img_patch = self.encode_image(pixel_values)
-        txt_pool, txt_latent = self.encode_text(input_ids, attention_mask, position_ids, meta_tensor)
+        txt_pool, compressed_text_features = self.encode_text(input_ids, attention_mask, position_ids, meta_tensor)
         if return_loss:
-            return self.compute_loss(img_pool, txt_pool, img_patch, txt_latent)
+            return self.compute_loss(img_pool, txt_pool, img_patch, compressed_text_features)
         return {
             "text_pooled": txt_pool,
-            "text_latents": txt_latent,
+            "text_latents": compressed_text_features,
             "image_pooled": img_pool,
             "image_patches": img_patch,
         }

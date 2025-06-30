@@ -10,7 +10,7 @@ import math
 with open("imagenet_map.txt") as f:
     _map = dict(line.split(" ", 1) for line in f)
 
-IMAGENET_CAPTIONS = [_map[k] for k in sorted(_map.keys())]  # exported for model
+IMAGENET_CAPTIONS = [_map[k] for k in sorted(_map.keys())]
 
 print(IMAGENET_CAPTIONS[:10])
 

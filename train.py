@@ -52,7 +52,7 @@ parser.add_argument(
 )
 
 parser.add_argument(
-    "--n-register-encoder-layers",
+    "--n-text-compressing-layers",
     type=int,
     default=8,
     help="Number of layers to register for encoder",
@@ -61,9 +61,10 @@ parser.add_argument(
 parser.add_argument(
     "--loss-weights",
     type=str,
-    default="0.6,0.4",
-    help="Weights for the loss components (pool_loss, patch_loss). 1.0,0.0 means original CLIP",
+    default="0.6,0.4,0.0",
+    help="Weights for the loss components (pool_loss, patch_loss, ctf_loss). 1.0,0.0,0.0 means original CLIP",
 )
+
 
 args = parser.parse_args()
 
@@ -94,7 +95,7 @@ model = WrapPatchWiseClip(
     pretrained_clip_id=args.pretrained_clip_id,
     learning_rate=args.learning_rate,
     weight_decay=args.weight_decay,
-    n_register_encoder_layers=args.n_register_encoder_layers,
+    n_text_compressing_layers=args.n_text_compressing_layers,
     loss_weights=[float(w) for w in args.loss_weights.split(",")],
 )
 
@@ -109,7 +110,7 @@ trainer = L.Trainer(
     callbacks=[
         LearningRateMonitor(logging_interval="step"),
         ModelCheckpoint(
-            dirpath=f"checkpoints/{args.pretrained_clip_id.split('/')[-1]}/{args.n_register_encoder_layers}-{args.loss_weights}",
+            dirpath=f"checkpoints/{args.pretrained_clip_id.split('/')[-1]}/{args.n_text_compressing_layers}-{args.loss_weights}",
             filename="best-{epoch:02d}-{val_acc_global:.2f}",
             save_last=True,
             save_top_k=3,
