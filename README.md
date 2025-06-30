@@ -2,74 +2,77 @@
 
 ## Problem Statement
 
-Traditional CLIP models face an inherent architectural mismatch: image encoders produce a fixed number of patch features (e.g., 49 patches for a 7×7 grid), while text encoders generate variable-length token sequences. This asymmetry limits the model's ability to establish fine-grained correspondences between specific text semantics and visual regions.
+Traditional CLIP models face an architectural mismatch:
+
+* **Image encoders** output a fixed number of patch features (e.g., 49 patches for a 7 × 7 grid).
+* **Text encoders** output a variable-length sequence of token embeddings.
+
+Because the two modalities differ in length, it is hard to learn **fine-grained correspondences** between specific text semantics and specific image regions.
 
 ## Proposed Solution
 
-We propose enhancing CLIP with **local alignment** capabilities that enable correspondence between semantic text components and spatial image regions, while maintaining the global text-image alignment that makes CLIP effective.
+We enhance CLIP with a **local-alignment mechanism** that learns spatial correspondences while preserving CLIP’s strong global alignment.
 
-### Core Innovation: Text Feature Compression Module
+### 1. Text Feature Compression Module
 
-The key contribution is a learnable compression module that transforms variable-length text features into a fixed-size representation matching the spatial dimensions of image patches:
-
-$$
-\mathbf{T} = \text{TextEncoder}(\text) \in \mathbb{R}^{N \times d}
-$$
+A learnable compression module converts the variable-length text features into a fixed-size tensor whose length matches the number of image patches.
 
 $$
-\mathbf{I} = \text{ImageEncoder}(\text{image}) \in \mathbb{R}^{M \times d}
+\begin{aligned}
+\mathbf{T} &= \text{TextEncoder}(\text) \in \mathbb{R}^{N \times d} \\[4pt]
+\mathbf{I} &= \text{ImageEncoder}(\text{image}) \in \mathbb{R}^{M \times d} \\[4pt]
+\mathbf{T}_{\text{compressed}} &= \text{CompressionModule}\!\bigl(\mathbf{T},\,\mathbf{R}\bigr) \in \mathbb{R}^{M \times d}
+\end{aligned}
 $$
 
-$$
-\mathbf{T}_{compressed} = \text{CompressionModule}(\mathbf{T}, \mathbf{R}) \in \mathbb{R}^{M \times d}
-$$
+where
 
-where:
-- $\mathbf{T}$ represents variable-length text features ($N$ tokens)
-- $\mathbf{I}$ represents fixed-size image patch features ($M$ patches)
-- $\mathbf{R}$ are learnable register tokens that serve as compression anchors
-- $\mathbf{T}_{compressed}$ matches the spatial structure of image patches
+* $N$ = number of tokens, $M$ = number of patches, $d$ = embedding dim
+* $\mathbf{R}\in\mathbb{R}^{M\times d}$ are **learnable register tokens** that act as semantic “slots”
+* $\mathbf{T}_{\text{compressed}}$ is aligned one-to-one with image patches
 
-### Architecture Details
+**Inside the module**
 
-**Compression Module Design:**
-- Uses cross-attention mechanism with learnable register tokens
-- Register tokens act as semantic "slots" that aggregate relevant text information
-- Preserves semantic meaning while enforcing spatial correspondence
-- Enables gradient flow back to text encoder for end-to-end training
+* Cross-attention lets each register pull the text information it needs.
+* Registers are updated and returned as $\mathbf{T}_{\text{compressed}}$.
+* Gradients flow through to the text encoder, so the entire model trains end-to-end.
 
-**Multi-Level Objective Function:**
-$$
-\mathcal{L}_{total} = \lambda_{global} \cdot \mathcal{L}_{global} + \lambda_{local} \cdot \mathcal{L}_{local}
-$$
+### 2. Multi-Level Objective
 
-where:
-- $\mathcal{L}_{global}$: Standard CLIP contrastive loss on pooled features
-- $\mathcal{L}_{local}$: Patch-wise alignment loss between compressed text features and image patches
-- $\lambda_{global}$, $\lambda_{local}$: Balancing hyperparameters
-
-### Local Alignment Loss
-
-The local alignment loss encourages correspondence between compressed text features and relevant image regions:
+The overall loss combines global CLIP contrastive loss and a new local alignment loss:
 
 $$
-\mathcal{L}_{local} = \sum_{i=1}^{M} \text{CrossEntropy}(\text{sim}(\mathbf{T}_{compressed}^{(i)}, \mathbf{I}^{(i)}))
+\mathcal{L}_{\text{total}}
+  = \lambda_{\text{global}}\,\mathcal{L}_{\text{global}}
+  \;+\;
+  \lambda_{\text{local}}\,\mathcal{L}_{\text{local}} .
 $$
 
-This creates a spatial attention mechanism that learns which text semantics correspond to which image regions.
+* **Global loss** $\mathcal{L}_{\text{global}}$: standard CLIP loss on pooled image/text features.
+* **Local loss** $\mathcal{L}_{\text{local}}$: patch-wise alignment term:
 
-## Expected Benefits
+$$
+\mathcal{L}_{\text{local}}
+  \;=\;
+  \sum_{i=1}^{M}
+    \operatorname{CrossEntropy}\!\bigl(
+      \operatorname{sim}\,(
+        \mathbf{T}_{\text{compressed}}^{(i)},
+        \mathbf{I}^{(i)}
+      )
+    \bigr).
+$$
 
-1. **Fine-grained Understanding**: Model learns associations between text phrases and visual regions
-2. **Improved Localization**: Better performance on tasks requiring spatial reasoning
-3. **Semantic Grounding**: Explicit alignment between language concepts and visual elements
-4. **Maintained Global Performance**: Preserves CLIP's strong global alignment capabilities
+### 3. Expected Benefits
 
-## Applications
+1. **Fine-grained understanding** — learns phrase-to-region links.
+2. **Improved localization** — boosts tasks that need spatial reasoning.
+3. **Semantic grounding** — language concepts are explicitly tied to visual elements.
+4. **No loss of global strength** — keeps CLIP’s original retrieval power.
 
-- **Visual Question Answering**: Better understanding of spatial relationships
-- **Image Captioning**: More accurate description of object locations and interactions
-- **Object Detection**: Improved text-to-region correspondence
-- **Multimodal Retrieval**: Enhanced fine-grained matching capabilities
+### 4. Applications
 
-This approach extends CLIP's capabilities from global text-image matching to include local semantic-spatial correspondence, enabling more nuanced multimodal understanding.
+* **Visual Question Answering**: richer spatial context for complex queries.
+* **Image Captioning**: more precise object placement and relations.
+* **Object Detection / Phrase-Grounding**: better text-to-box correspondence.
+* **Fine-Grained Retrieval**: discriminate on subtle region-level details.
