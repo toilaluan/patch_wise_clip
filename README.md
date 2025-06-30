@@ -4,9 +4,12 @@
 
 Traditional CLIP models face an inherent architectural mismatch: image encoders produce a fixed number of patch features (e.g., 49 patches for a 7×7 grid), while text encoders generate variable-length token sequences. This asymmetry limits the model's ability to establish fine-grained correspondences between specific text semantics and visual regions.
 
+Related Work: [FILIP: Fine-grained Interactive Language-Image Pre-Training](https://arxiv.org/abs/2111.07783)
+
 ## Proposed Solution
 
-We propose enhancing CLIP with **local alignment** capabilities that enable correspondence between semantic text components and spatial image regions, while maintaining the global text-image alignment that makes CLIP effective.
+We propose enhancing CLIP with **local alignment** capabilities that enable correspondence between semantic text components and spatial image regions, while maintaining the global text-image alignment that makes CLIP effective. We finally aim to find better pretrained text encoders in Text-to-Image or related multimodal tasks.
+
 
 ### Core Innovation: Text Feature Compression Module
 
