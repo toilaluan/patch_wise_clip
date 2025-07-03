@@ -6,13 +6,9 @@ import random
 import torch
 import math
 import json
-# # Load the mapping you already have
-# with open("imagenet_map.txt") as f:
-#     _map = dict(line.split(" ", 1) for line in f)
 
 IMAGENET_CAPTIONS = json.load(open("imagenet_map.txt"))
 
-# print(IMAGENET_CAPTIONS[:10])
 
 class ClipDataset(Dataset):
     def __init__(self, pretrained_clip_id: str, is_train=True):
@@ -20,10 +16,6 @@ class ClipDataset(Dataset):
             "pixparse/cc3m-wds", split="train", num_proc=16
         )
         print(len(self.ds), is_train)
-        # self.ds = self.ds.filter(
-        #     lambda x: x["jpg"].size[0] >= 112 and x["jpg"].size[1] >= 112,
-        #     num_proc=16,
-        # )
         self.processor = CLIPProcessor.from_pretrained(pretrained_clip_id)
         self.target_size = self.processor.image_processor.size["shortest_edge"]
         print(f"Target size: {self.target_size}")
@@ -32,7 +24,12 @@ class ClipDataset(Dataset):
         return len(self.ds)
 
     def __getitem__(self, index):
-        x = self.ds[index]
+        try:
+            x = self.ds[index]
+        except Exception as e:
+            print(f"Error at index {index}: {e}")
+            return self.__getitem__(random.randint(0, len(self.ds)))
+
         image = x["jpg"]
         width, height = image.size
         ratio = width / height
@@ -64,7 +61,12 @@ class ImageNetDataset(Dataset):
     def __len__(self): return len(self.ds)
 
     def __getitem__(self, idx):
-        item = self.ds[idx]
+        try:
+            item = self.ds[idx]
+        except Exception as e:
+            print(f"Error at index {idx}: {e}")
+            return self.__getitem__(random.randint(0, len(self.ds)))
+
         img = item["jpg"]
         w, h = img.size
         ratio, scale = w / h, math.sqrt(w * h / (self.target**2))
