@@ -107,7 +107,7 @@ class PatchWiseCLIP(nn.Module):
         patch_sim = (img_patch.unsqueeze(1) * compressed_text_features.unsqueeze(0)).sum(-1) * scale  # (B_img, B_txt, N)
         patch_logits = patch_sim.sum(-1)  # aggregate over patches → (B_img, B_txt)
         patch_loss = clip_loss(patch_logits)
-        ctf_sim = (compressed_text_features.unsqueeze(1) * compressed_text_features.unsqueeze(0)).sum(-1)
+        ctf_sim = (compressed_text_features.unsqueeze(1) * compressed_text_features.unsqueeze(0)).sum(-1).sum(-1)
         ctf_loss = clip_loss(ctf_sim)
         return pool_loss, patch_loss, ctf_loss
 

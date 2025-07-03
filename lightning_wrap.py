@@ -44,8 +44,9 @@ class WrapPatchWiseClip(L.LightningModule):
         processor_kwargs = dict(
             padding="max_length", max_length=77, truncation=True, return_tensors="pt"
         )
+        labels = [str(i) for i in range(len(IMAGENET_CAPTIONS))]
         proc_out = self.processor(
-            text=[f"An image of a {c}" for c in IMAGENET_CAPTIONS], **processor_kwargs
+            text=[f"An image of a {IMAGENET_CAPTIONS[i]}" for i in labels], **processor_kwargs
         ).to(self.device)
 
         with torch.no_grad():
@@ -87,6 +88,7 @@ class WrapPatchWiseClip(L.LightningModule):
     # ---------- fast validation --------------------------------------------
     def on_validation_epoch_start(self):
         self.clip.eval()
+        self.validation_step_outputs = []
         if self.txt_pool.shape[0] == 0:
             self.setup("validate")
 
@@ -123,10 +125,11 @@ class WrapPatchWiseClip(L.LightningModule):
             on_epoch=True,
             prog_bar=True,
         )
-        return (preds_c == labels).float().mean()
+        acc = (preds_c == labels).float().mean()
+        self.validation_step_outputs.append(acc)
     
-    def on_validation_epoch_end(self, outputs):
-        acc = torch.stack(outputs).mean()
+    def on_validation_epoch_end(self):
+        acc = torch.stack(self.validation_step_outputs).mean()
         if acc > self.best_val_acc:
             self.best_val_acc = acc
             self.clip.model.push_to_hub(self.hf_output_id)

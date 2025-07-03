@@ -5,25 +5,25 @@ from transformers import CLIPProcessor, CLIPImageProcessor
 import random
 import torch
 import math
+import json
+# # Load the mapping you already have
+# with open("imagenet_map.txt") as f:
+#     _map = dict(line.split(" ", 1) for line in f)
 
-# Load the mapping you already have
-with open("imagenet_map.txt") as f:
-    _map = dict(line.split(" ", 1) for line in f)
+IMAGENET_CAPTIONS = json.load(open("imagenet_map.txt"))
 
-IMAGENET_CAPTIONS = [_map[k] for k in sorted(_map.keys())]
-
-print(IMAGENET_CAPTIONS[:10])
+# print(IMAGENET_CAPTIONS[:10])
 
 class ClipDataset(Dataset):
     def __init__(self, pretrained_clip_id: str, is_train=True):
         self.ds = load_dataset(
-            "svjack/conceptual_captions_3m_en_tiny", split="train", num_proc=16
+            "pixparse/cc3m-wds", split="train", num_proc=16
         )
         print(len(self.ds), is_train)
-        self.ds = self.ds.filter(
-            lambda x: x["image"].size[0] >= 112 and x["image"].size[1] >= 112,
-            num_proc=16,
-        )
+        # self.ds = self.ds.filter(
+        #     lambda x: x["jpg"].size[0] >= 112 and x["jpg"].size[1] >= 112,
+        #     num_proc=16,
+        # )
         self.processor = CLIPProcessor.from_pretrained(pretrained_clip_id)
         self.target_size = self.processor.image_processor.size["shortest_edge"]
         print(f"Target size: {self.target_size}")
@@ -33,13 +33,13 @@ class ClipDataset(Dataset):
 
     def __getitem__(self, index):
         x = self.ds[index]
-        image = x["image"]
+        image = x["jpg"]
         width, height = image.size
         ratio = width / height
         scale = math.sqrt(width * height / (self.target_size**2))
         out = self.processor(
-            images=x["image"],
-            text=x["caption"],
+            images=x["jpg"],
+            text=x["txt"],
             return_tensors="pt",
             padding="max_length",
             max_length=77,
@@ -57,7 +57,7 @@ class ImageNetDataset(Dataset):
     """Returns only image tensor + label (no per-example caption duplication)."""
 
     def __init__(self, processor: CLIPImageProcessor):
-        self.ds = load_dataset("mrm8488/ImageNet1K-val", split="train")
+        self.ds = load_dataset("timm/imagenet-1k-wds", split="validation", num_proc=16)
         self.proc = processor
         self.target = self.proc.image_processor.size["shortest_edge"]
 
@@ -65,14 +65,14 @@ class ImageNetDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.ds[idx]
-        img = item["image"]
+        img = item["jpg"]
         w, h = img.size
         ratio, scale = w / h, math.sqrt(w * h / (self.target**2))
 
         pix = self.proc(images=img, return_tensors="pt")["pixel_values"].squeeze(0)
         return {
             "pixel_values": pix,
-            "label": int(item["label"]),
+            "label": int(item["cls"]),
             "meta_tensor": torch.tensor([ratio, scale]),
         }
 

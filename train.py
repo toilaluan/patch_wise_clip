@@ -6,6 +6,7 @@ from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch import seed_everything
 from argparse import ArgumentParser
+from lightning.pytorch.strategies import DDPStrategy
 
 parser = ArgumentParser()
 
@@ -120,9 +121,9 @@ trainer = L.Trainer(
         ),
     ],
     accelerator="gpu",
-    devices=1,
     precision="bf16-mixed",
     accumulate_grad_batches=1,
+    devices=2, strategy=DDPStrategy(find_unused_parameters=True)
 )
 
 trainer.fit(model, train_dataloaders=train_dl, val_dataloaders=val_dl)
