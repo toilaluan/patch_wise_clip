@@ -10,6 +10,7 @@ dependencies = [
     "fairscale>=0.4.13",
     "lightning>=2.5.1.post0",
     "mmdit>=0.2.2",
+    "nvitop>=1.5.1",
     "ruff>=0.11.8",
     "s3fs>=2025.3.0",
     "torch>=2.7.0",

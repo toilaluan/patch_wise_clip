@@ -4,17 +4,7 @@ import torch.nn.functional as F
 import lightning as L
 from transformers import CLIPModel, CLIPProcessor, CLIPConfig
 from mmdit.mmdit_generalized_pytorch import MMDiT
-
-
-# ───────────────────────── loss helpers ────────────────────────── #
-
-def _contrastive_loss(logits: torch.Tensor) -> torch.Tensor:
-    """Standard contrastive cross‑entropy used in CLIP."""
-    return F.cross_entropy(logits, torch.arange(len(logits), device=logits.device))
-
-
-def clip_loss(sim: torch.Tensor) -> torch.Tensor:
-    return (_contrastive_loss(sim) + _contrastive_loss(sim.t())) / 2.0
+from .loss import clip_loss
 
 
 # ───────────────────────── building blocks ─────────────────────── #
@@ -69,6 +59,9 @@ class PatchWiseCLIP(nn.Module):
         else:
             self.token_compressor = None
             self.patch_logit_s = None
+        
+    def configure_model(self):
+        self.model = torch.compile(self.model)
 
     # ------------------------------- encoders ------------------------------ #
 

@@ -18,7 +18,7 @@ class WrapPatchWiseClip(L.LightningModule):
         hf_output_id: str = "toilaluan/patch-wise-clip",
     ):
         super().__init__()
-        self.hf_output_id = hf_output_id + f"-{n_text_compressing_layers}clayers-{loss_weights[0]}pool-{loss_weights[1]}patch"
+        self.hf_output_id = hf_output_id + f"-{n_text_compressing_layers}clayers-{loss_weights[0]}pool-{loss_weights[1]}patch-{loss_weights[2]}ctf"
         self.clip = PatchWiseCLIP(
             pretrained_clip_id, text_compressing_layers=n_text_compressing_layers
         )
@@ -36,6 +36,7 @@ class WrapPatchWiseClip(L.LightningModule):
 
     # ---------- text cache --------------------------------------------------
     def setup(self, stage: str) -> None:
+        print(f"Setting up {stage}")
         if stage != "validate":
             return
 
@@ -45,9 +46,12 @@ class WrapPatchWiseClip(L.LightningModule):
             padding="max_length", max_length=77, truncation=True, return_tensors="pt"
         )
         labels = [str(i) for i in range(len(IMAGENET_CAPTIONS))]
+        captions = [f"An image of a {IMAGENET_CAPTIONS[i]}" for i in labels]
+        print(f"captions: {captions[:10]}")
         proc_out = self.processor(
-            text=[f"An image of a {IMAGENET_CAPTIONS[i]}" for i in labels], **processor_kwargs
+            text=captions, **processor_kwargs
         ).to(self.device)
+        # print(f"proc_out: {proc_out}")
 
         with torch.no_grad():
             self.clip.eval()
@@ -89,8 +93,8 @@ class WrapPatchWiseClip(L.LightningModule):
     def on_validation_epoch_start(self):
         self.clip.eval()
         self.validation_step_outputs = []
-        if self.txt_pool.shape[0] == 0:
-            self.setup("validate")
+        # if self.txt_pool.shape[0] == 0:
+        self.setup("validate")
 
     @torch.no_grad()
     def validation_step(self, batch, _):
@@ -124,6 +128,7 @@ class WrapPatchWiseClip(L.LightningModule):
             },
             on_epoch=True,
             prog_bar=True,
+            sync_dist=True,
         )
         acc = (preds_c == labels).float().mean()
         self.validation_step_outputs.append(acc)
@@ -132,7 +137,8 @@ class WrapPatchWiseClip(L.LightningModule):
         acc = torch.stack(self.validation_step_outputs).mean()
         if acc > self.best_val_acc:
             self.best_val_acc = acc
-            self.clip.model.push_to_hub(self.hf_output_id)
+            if self.trainer.is_global_zero:
+                self.clip.model.push_to_hub(self.hf_output_id)
 
     # ---------- optim ------------------------------------------------------
     def configure_optimizers(self):
@@ -140,5 +146,6 @@ class WrapPatchWiseClip(L.LightningModule):
             (p for p in self.parameters() if p.requires_grad),
             lr=self.lr,
             weight_decay=self.wd,
+            betas=(0.9, 0.98),
         )
         return opt
