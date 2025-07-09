@@ -1,5 +1,6 @@
 import torch, lightning as L
 from patch_wise_clip.model import PatchWiseCLIP
+from patch_wise_clip.zeroshot_metadata import IMAGENET_CAPTIONS, OPENAI_IMAGENET_TEMPLATES
 from transformers import CLIPProcessor
 
 POOL_W = 0.6
@@ -45,13 +46,10 @@ class WrapPatchWiseClip(L.LightningModule):
         processor_kwargs = dict(
             padding="max_length", max_length=77, truncation=True, return_tensors="pt"
         )
-        labels = [str(i) for i in range(len(IMAGENET_CAPTIONS))]
-        captions = [f"An image of a {IMAGENET_CAPTIONS[i]}" for i in labels]
-        print(f"captions: {captions[:10]}")
+        texts = [template.format(c) for c in IMAGENET_CAPTIONS for template in OPENAI_IMAGENET_TEMPLATES]
         proc_out = self.processor(
-            text=captions, **processor_kwargs
+            text=texts, **processor_kwargs
         ).to(self.device)
-        # print(f"proc_out: {proc_out}")
 
         with torch.no_grad():
             self.clip.eval()
@@ -61,11 +59,14 @@ class WrapPatchWiseClip(L.LightningModule):
                 meta=None,
             )
 
-        # Normalise once so later we can just use matmul
-        self.txt_pool = torch.nn.functional.normalize(txt_pool, dim=-1)
-        self.txt_latent = (
+        txt_pool = txt_pool.reshape(len(IMAGENET_CAPTIONS), len(OPENAI_IMAGENET_TEMPLATES), -1).mean(dim=1)
+        txt_latent = txt_latent.reshape(len(IMAGENET_CAPTIONS), len(OPENAI_IMAGENET_TEMPLATES), -1).mean(dim=1)
+        txt_pool = torch.nn.functional.normalize(txt_pool, dim=-1)
+        txt_latent = (
             torch.nn.functional.normalize(txt_latent, dim=-1) if txt_latent is not None else None
         )
+        self.txt_pool = txt_pool
+        self.txt_latent = txt_latent
         print(f"Will be pushing to {self.hf_output_id}")
         print(f"txt_pool shape: {self.txt_pool.shape}")
         print(f"txt_latent shape: {self.txt_latent.shape}")
