@@ -11,7 +11,7 @@ IMAGENET_CAPTIONS = json.load(open("imagenet_map.txt"))
 
 
 class ClipDataset(Dataset):
-    def __init__(self, pretrained_clip_id: str, is_train=True):
+    def __init__(self, pretrained_clip_id: str, is_train=True, transform=None):
         self.ds = load_dataset(
             "pixparse/cc3m-wds", split="train", num_proc=16
         )
@@ -19,6 +19,7 @@ class ClipDataset(Dataset):
         self.processor = CLIPProcessor.from_pretrained(pretrained_clip_id)
         self.target_size = self.processor.image_processor.size["shortest_edge"]
         print(f"Target size: {self.target_size}")
+        self.transform = transform
 
     def __len__(self):
         return len(self.ds)
@@ -35,13 +36,13 @@ class ClipDataset(Dataset):
         ratio = width / height
         scale = math.sqrt(width * height / (self.target_size**2))
         out = self.processor(
-            images=x["jpg"],
             text=x["txt"],
             return_tensors="pt",
             padding="max_length",
             max_length=77,
             truncation=True,
         )
+        out["pixel_values"] = self.transform(image).unsqueeze(0)
         for k, v in out.items():
             out[k] = v.squeeze(0)
         out["meta_tensor"] = torch.tensor([ratio, scale])
@@ -53,11 +54,11 @@ class ClipDataset(Dataset):
 class ImageNetDataset(Dataset):
     """Returns only image tensor + label (no per-example caption duplication)."""
 
-    def __init__(self, processor: CLIPImageProcessor):
+    def __init__(self, processor: CLIPImageProcessor, transform=None):
         self.ds = load_dataset("timm/imagenet-1k-wds", split="validation", num_proc=16)
         self.proc = processor
         self.target = self.proc.image_processor.size["shortest_edge"]
-
+        self.transform = transform
     def __len__(self): return len(self.ds)
 
     def __getitem__(self, idx):
@@ -71,7 +72,7 @@ class ImageNetDataset(Dataset):
         w, h = img.size
         ratio, scale = w / h, math.sqrt(w * h / (self.target**2))
 
-        pix = self.proc(images=img, return_tensors="pt")["pixel_values"].squeeze(0)
+        pix = self.transform(img).unsqueeze(0)
         return {
             "pixel_values": pix,
             "label": int(item["cls"]),

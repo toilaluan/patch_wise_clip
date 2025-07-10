@@ -1,7 +1,9 @@
 import torch, lightning as L
 from patch_wise_clip.model import PatchWiseCLIP
-from patch_wise_clip.zeroshot_metadata import IMAGENET_CAPTIONS, OPENAI_IMAGENET_TEMPLATES
+from patch_wise_clip.zeroshot_metadata import IMAGENET_CLASSNAMES, OPENAI_IMAGENET_TEMPLATES
 from transformers import CLIPProcessor
+from tqdm import tqdm
+import torch.distributed as dist
 
 POOL_W = 0.6
 PATCH_W = 0.4
@@ -38,29 +40,48 @@ class WrapPatchWiseClip(L.LightningModule):
     # ---------- text cache --------------------------------------------------
     def setup(self, stage: str) -> None:
         print(f"Setting up {stage}")
+        print(f"Train steps: {self.trainer.estimated_stepping_batches}")
         if stage != "validate":
             return
 
-        # Build captions once per process
-        from data import IMAGENET_CAPTIONS  # see dataset section below
         processor_kwargs = dict(
             padding="max_length", max_length=77, truncation=True, return_tensors="pt"
         )
-        texts = [template.format(c) for c in IMAGENET_CAPTIONS for template in OPENAI_IMAGENET_TEMPLATES]
-        proc_out = self.processor(
-            text=texts, **processor_kwargs
-        ).to(self.device)
+        N_TEMPLATES = len(OPENAI_IMAGENET_TEMPLATES)
+        N_CLASSES = len(IMAGENET_CLASSNAMES)
+        local_rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        templates = []
+        for i, template in enumerate(OPENAI_IMAGENET_TEMPLATES[:N_TEMPLATES]):
+            if i % world_size == local_rank:
+                templates.append(template)
+                print(f"Rank {local_rank} is processing template {i} of {N_TEMPLATES}")
+        texts = [template(c) for c in IMAGENET_CLASSNAMES for template in templates]
+        self.clip.eval()
+        total_txt_pool = []
+        total_txt_latent = []
+        batch_texts = [texts[i:i+N_CLASSES] for i in range(0, len(texts), N_CLASSES)]
 
-        with torch.no_grad():
-            self.clip.eval()
-            txt_pool, txt_latent = self.clip.encode_text(
-                input_ids=proc_out["input_ids"],
-                attention_mask=proc_out["attention_mask"],
-                meta=None,
-            )
+        for batch_texts in tqdm(batch_texts, desc="Processing texts"):
+            proc_out = self.processor(
+                text=batch_texts, **processor_kwargs
+            ).to(self.device)
+            with torch.no_grad():
+                txt_pool, txt_latent = self.clip.encode_text(
+                    input_ids=proc_out["input_ids"],
+                    attention_mask=proc_out["attention_mask"],
+                    meta=None,
+                )
+                total_txt_pool.append(txt_pool)
+                total_txt_latent.append(txt_latent)
+        txt_pool = torch.cat(total_txt_pool, dim=0)
+        txt_latent = torch.cat(total_txt_latent, dim=0)
 
-        txt_pool = txt_pool.reshape(len(IMAGENET_CAPTIONS), len(OPENAI_IMAGENET_TEMPLATES), -1).mean(dim=1)
-        txt_latent = txt_latent.reshape(len(IMAGENET_CAPTIONS), len(OPENAI_IMAGENET_TEMPLATES), -1).mean(dim=1)
+        txt_pool = txt_pool.reshape(N_CLASSES, len(templates), -1).mean(dim=1)
+        txt_latent = txt_latent.reshape(N_CLASSES, len(templates), txt_latent.shape[-2], txt_latent.shape[-1]).mean(dim=1)
+        dist.barrier()
+        dist.all_reduce(txt_pool, op=dist.ReduceOp.AVG)
+        dist.all_reduce(txt_latent, op=dist.ReduceOp.AVG)
         txt_pool = torch.nn.functional.normalize(txt_pool, dim=-1)
         txt_latent = (
             torch.nn.functional.normalize(txt_latent, dim=-1) if txt_latent is not None else None
@@ -148,5 +169,14 @@ class WrapPatchWiseClip(L.LightningModule):
             lr=self.lr,
             weight_decay=self.wd,
             betas=(0.9, 0.98),
+            # eps=1e-8,
         )
-        return opt
+        # scheduler = CosineWarmupScheduler(opt, 2000, self.trainer.estimated_stepping_batches, verbose=True)
+        return {
+            "optimizer": opt,
+            # "lr_scheduler": {
+            #     "scheduler": scheduler,
+            #     "interval": "step",
+            #     "frequency": 1,
+            # },
+        }

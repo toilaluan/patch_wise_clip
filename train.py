@@ -7,6 +7,7 @@ from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch import seed_everything
 from argparse import ArgumentParser
 from lightning.pytorch.strategies import DDPStrategy
+from torchvision import transforms
 
 parser = ArgumentParser()
 
@@ -74,8 +75,24 @@ seed_everything(42)
 wandb_logger = WandbLogger(project="Patch-Wise-CLIP")
 
 
-train_dataset = ClipDataset(args.pretrained_clip_id, is_train=True)
-val_dataset = ImageNetDataset(processor=train_dataset.processor)
+normalize = transforms.Normalize(
+    mean=[0.485, 0.456, 0.406],
+    std=[0.229, 0.224, 0.225]
+)
+train_transform = transforms.Compose([
+    transforms.RandomResizedCrop(224, scale=(0.5, 1.0)),
+    transforms.ToTensor(),
+    normalize
+])
+val_transform = transforms.Compose([
+    transforms.Resize(224),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    normalize
+])
+
+train_dataset = ClipDataset(args.pretrained_clip_id, is_train=True, transform=train_transform)
+val_dataset = ImageNetDataset(processor=train_dataset.processor, transform=val_transform)
 
 print(f"Train dataset size: {len(train_dataset)}")
 print(f"Validation dataset size: {len(val_dataset)}")
@@ -123,7 +140,7 @@ trainer = L.Trainer(
     accelerator="gpu",
     precision="bf16-mixed",
     accumulate_grad_batches=1,
-    devices=2, strategy=DDPStrategy(find_unused_parameters=True)
+    devices=8, strategy=DDPStrategy(find_unused_parameters=True)
 )
 
 trainer.fit(model, train_dataloaders=train_dl, val_dataloaders=val_dl)
