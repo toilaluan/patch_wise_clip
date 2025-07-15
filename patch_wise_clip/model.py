@@ -3,9 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import lightning as L
 from transformers import CLIPModel, CLIPProcessor, CLIPConfig
-from mmdit.mmdit_generalized_pytorch import MMDiT
 from .loss import clip_loss
-
+from .transformer_model import Transformer
 
 # ───────────────────────── building blocks ─────────────────────── #
 
@@ -15,24 +14,21 @@ class TokenCompressor(nn.Module):
     def __init__(self, hidden: int, img_hidden: int, n_tokens: int, layers: int = 1):
         super().__init__()
         self.register = nn.Parameter(torch.randn(n_tokens, hidden) * 0.02)
-        self.mmdit = MMDiT(
-            depth=layers,
-            dim_modalities=[hidden, hidden],
-            dim_cond=256,
-            qk_rmsnorm=True,
+        self.encoder = Transformer(
+            hidden_size=hidden,
+            n_heads=8,
+            n_layers=layers,
+            mlp_ratio=4,
+            eps=1e-5,
         )
-        self.to_cond = nn.Linear(2, 256, bias=False)
         self.out_proj = nn.Linear(hidden, img_hidden)
 
     def forward(self, txt_hidden: torch.Tensor, mask: torch.Tensor, meta: torch.Tensor):
-        y = self.register.expand(txt_hidden.size(0), -1, -1)  # (B, N_reg, D)
-        y, _ = self.mmdit(
-            modality_tokens=(y, txt_hidden),
-            modality_masks=(None, mask),
-            time_cond=self.to_cond(meta),
-        )
-        y = self.out_proj(y)  # (B, N_reg, D_img)
-        return F.normalize(y, dim=-1)  # (B, N, D)
+        y = self.register.expand(txt_hidden.size(0), -1, -1)
+        mask = torch.cat([mask, torch.ones(mask.size(0), self.register.size(0), device=mask.device)], dim=1)
+        y = self.encoder(y, mask)
+        y = self.out_proj(y)
+        return y
 
 
 class PatchWiseCLIP(nn.Module):
@@ -83,9 +79,10 @@ class PatchWiseCLIP(nn.Module):
         if self.text_compressing_layers > 0:
             meta = meta if meta is not None else torch.zeros(len(input_ids), 2, device=input_ids.device)
             compressed_text_features = self.token_compressor(out.last_hidden_state, mask=attention_mask.bool(), meta=meta)
+            compressed_text_features = F.normalize(compressed_text_features, dim=-1)
         else:
             compressed_text_features = None
-        return pooled, compressed_text_features  # (B, D), (B, N, D)|None
+        return pooled, compressed_text_features
 
     # ------------------------------- loss ---------------------------------- #
 

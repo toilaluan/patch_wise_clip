@@ -54,10 +54,10 @@ class ClipDataset(Dataset):
 class ImageNetDataset(Dataset):
     """Returns only image tensor + label (no per-example caption duplication)."""
 
-    def __init__(self, processor: CLIPImageProcessor, transform=None):
+    def __init__(self, pretrained_clip_id: str, transform=None):
         self.ds = load_dataset("timm/imagenet-1k-wds", split="validation", num_proc=16)
-        self.proc = processor
-        self.target = self.proc.image_processor.size["shortest_edge"]
+        self.proc = CLIPImageProcessor.from_pretrained(pretrained_clip_id)
+        self.target = self.proc.size["shortest_edge"]
         self.transform = transform
     def __len__(self): return len(self.ds)
 
