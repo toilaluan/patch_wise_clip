@@ -13,6 +13,7 @@ class Attention(nn.Module):
         self.hidden_size = hidden_size
         self.n_heads = n_heads
         self.dropout = dropout
+        self.head_dim = hidden_size // n_heads
         self.to_q = nn.Linear(hidden_size, hidden_size)
         self.to_k = nn.Linear(hidden_size, hidden_size)
         self.to_v = nn.Linear(hidden_size, hidden_size)
@@ -28,15 +29,29 @@ class Attention(nn.Module):
         v = self.to_v(x)
         q = self.q_norm(q)
         k = self.k_norm(k)
-        q = q.view(q.size(0), q.size(1), self.n_heads, -1).transpose(1, 2)
-        k = k.view(k.size(0), k.size(1), self.n_heads, -1).transpose(1, 2)
-        v = v.view(v.size(0), v.size(1), self.n_heads, -1).transpose(1, 2)
-        mask = mask.unsqueeze(1) * mask.unsqueeze(2)
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=self.dropout if self.training else 0, is_causal=False)
+        q = q.view(q.size(0), -1, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(k.size(0), -1, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(v.size(0), -1, self.n_heads, self.head_dim).transpose(1, 2)
+        
+        # Fix the mask processing
+        if mask is not None:
+            # Convert 1D mask to 2D attention mask
+            # mask shape: [batch_size, seq_len] -> [batch_size, 1, seq_len, seq_len]
+            mask = mask.unsqueeze(1) * mask.unsqueeze(2)  # [batch_size, seq_len, seq_len]
+            mask = mask.unsqueeze(1)  # [batch_size, 1, seq_len, seq_len]
+            # Convert to boolean mask (True for positions to attend to)
+            mask = mask.bool()
+        
+        out = F.scaled_dot_product_attention(
+            q, k, v, 
+            attn_mask=mask, 
+            dropout_p=self.dropout if self.training else 0, 
+            is_causal=False
+        )
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
         out = self.to_out(out)
         return out
-    
+
 class FeedForward(nn.Module):
     def __init__(
         self,
@@ -77,8 +92,6 @@ class Block(nn.Module):
         x = x + self.mlp(self.norm2(x))
         return x
 
-
-
 class Transformer(nn.Module):
     def __init__(
         self, 
@@ -99,14 +112,13 @@ class Transformer(nn.Module):
         for layer in self.layers:
             h = layer(h, mask)
         return h
-    
 
 if __name__ == "__main__":
     model = Transformer(
-        hidden_size=384,
+        hidden_size=512,
         n_heads=4,
         n_layers=2,
-    )
-    h = torch.randn(1, 100, 384)
-    mask = torch.ones(1, 100, device=h.device)
+    ).to("cuda")
+    h = torch.randn(2, 126, 512).to("cuda")
+    mask = torch.ones(2, 126, device=h.device).to("cuda")
     print(model(h, mask).shape)

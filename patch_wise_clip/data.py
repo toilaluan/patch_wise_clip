@@ -7,7 +7,6 @@ import torch
 import math
 import json
 
-IMAGENET_CAPTIONS = json.load(open("imagenet_map.txt"))
 
 
 class ClipDataset(Dataset):
@@ -42,11 +41,15 @@ class ClipDataset(Dataset):
             max_length=77,
             truncation=True,
         )
-        out["pixel_values"] = self.transform(image).unsqueeze(0)
-        for k, v in out.items():
-            out[k] = v.squeeze(0)
-        out["meta_tensor"] = torch.tensor([ratio, scale])
-        return out
+        # out["pixel_values"] = self.transform(image).unsqueeze(0)
+        # for k, v in out.items():
+        #     out[k] = v.squeeze(0)
+        # out["meta_tensor"] = torch.tensor([ratio, scale])
+        pixel_values = self.transform(image.convert("RGB"))
+        input_ids = out["input_ids"].squeeze(0)
+        attention_mask = out["attention_mask"].squeeze(0)
+        meta_tensor = torch.tensor([ratio, scale])
+        return pixel_values, input_ids, attention_mask, meta_tensor
 
 
 
@@ -73,11 +76,7 @@ class ImageNetDataset(Dataset):
         ratio, scale = w / h, math.sqrt(w * h / (self.target**2))
 
         pix = self.transform(img).unsqueeze(0)
-        return {
-            "pixel_values": pix,
-            "label": int(item["cls"]),
-            "meta_tensor": torch.tensor([ratio, scale]),
-        }
+        return pix, item["cls"], torch.tensor([ratio, scale])
 
 
 if __name__ == "__main__":

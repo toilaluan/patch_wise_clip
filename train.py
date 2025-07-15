@@ -97,14 +97,24 @@ def create_transforms():
     return train_transform, val_transform
 
 
-def create_scheduler(optimizer, total_steps: int, warmup_steps: int, min_lr: float, max_lr: float):
+def create_scheduler(optimizer, total_steps: int, warmup_steps: int, min_lr: float, max_lr: float, rank: int = 0):
     """Create learning rate scheduler with warmup and cosine decay"""
+    print(f"Total steps: {total_steps}, Warmup steps: {warmup_steps}, Min LR: {min_lr}, Max LR: {max_lr}")
+    
     def get_lr(step):
         if step < warmup_steps:
-            return max_lr * step / warmup_steps
-        return min_lr + (max_lr - min_lr) * (
-            1 + math.cos(math.pi * (step - warmup_steps) / (total_steps - warmup_steps))
-        ) / 2
+            # Linear warmup
+            if rank == 0:
+                print(f"Linear warmup: {step / warmup_steps}")
+            return min_lr + (max_lr - min_lr) * step / warmup_steps
+        else:
+            # Cosine decay after warmup
+            decay_steps = total_steps - warmup_steps
+            current_decay_step = step - warmup_steps
+            cosine_factor = 0.5 * (1 + math.cos(math.pi * current_decay_step / decay_steps))
+            if rank == 0:
+                print(f"Cosine factor: {cosine_factor}")
+            return min_lr + (max_lr - min_lr) * cosine_factor
     
     return torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
 
@@ -148,6 +158,10 @@ def train_one_epoch(model, optimizer, scheduler, train_loader,
                    epoch: int, args, logger, device: torch.device, dtype: torch.dtype, local_rank: int = 0):
     """Train model for one epoch with refactored loss calculation"""
     model.train()
+
+    total_trainable_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_parameters = sum(p.numel() for p in model.parameters())
+    print(f"Total trainable parameters: {total_trainable_parameters / total_parameters * 100:.2f}%")
     
     # Initialize metrics tracking
     metrics = {
@@ -182,12 +196,12 @@ def train_one_epoch(model, optimizer, scheduler, train_loader,
         optimizer.zero_grad()
         
         # Forward pass
-        img_pool, img_patch_features = model.encode_image(pixel_values)
-        txt_pool, compressed_text_features = model.encode_text(input_ids, attention_mask, meta_tensor)
+        img_pool, img_patch_features = model.module.encode_image(pixel_values)
+        txt_pool, compressed_text_features = model.module.encode_text(input_ids, attention_mask, meta=meta_tensor)
         
         # Calculate losses using refactored logic
         pool_loss, patch_loss = loss_calculator.calculate_losses(
-            img_pool, img_patch_features, txt_pool, compressed_text_features, device
+            img_pool, img_patch_features, txt_pool, compressed_text_features, device, model.module.pool_scale, model.module.patch_scale
         )
         
         # Combined loss
@@ -195,14 +209,20 @@ def train_one_epoch(model, optimizer, scheduler, train_loader,
         
         # Backward pass
         total_batch_loss.backward()
+        total_norm = 0
+        for p in model.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        total_norm = total_norm ** (1. / 2)
         
         # Gradient clipping
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        
+        param_before = {name: param.clone() for name, param in model.named_parameters()}
         optimizer.step()
-        scheduler.step()
-        
+        # scheduler.step()
+
         # Update metrics
         metrics['total_loss'] += total_batch_loss.item()
         metrics['pool_loss'] += pool_loss.item()
@@ -210,9 +230,16 @@ def train_one_epoch(model, optimizer, scheduler, train_loader,
         metrics['num_batches'] += 1
         
         # Logging
-        if step % args.log_interval == 0 or step == len(train_loader) - 1:
+        if (step % args.log_interval == 0 or step == len(train_loader) - 1) and local_rank == 0:
             batch_time = time.time() - batch_start_time
-            current_lr = scheduler.get_last_lr()[0]
+            # current_lr = scheduler.get_last_lr()[0]
+            current_lr = optimizer.param_groups[0]['lr']
+
+            param_changes = {}
+            for name, param in model.named_parameters():
+                param_changes[name] = torch.norm(param - param_before[name]).item()
+                
+            max_change = max(param_changes.values())
             
             logger.info(
                 f"Epoch {epoch}, Step {step}/{len(train_loader)}, "
@@ -220,7 +247,9 @@ def train_one_epoch(model, optimizer, scheduler, train_loader,
                 f"Pool Loss: {pool_loss.item():.4f}, "
                 f"Patch Loss: {patch_loss.item():.4f}, "
                 f"LR: {current_lr:.6f}, "
-                f"Batch Time: {batch_time:.3f}s"
+                f"Batch Time: {batch_time:.3f}s, "
+                f"Max Parameter Change: {max_change:.6f}, "
+                f"Total Norm: {total_norm:.6f}"
             )
             
             # Wandb logging (only from rank 0)
@@ -235,6 +264,7 @@ def train_one_epoch(model, optimizer, scheduler, train_loader,
                     "train/epoch": epoch,
                     "train/step": global_step,
                 }, step=global_step)
+
     
     # Calculate epoch averages
     epoch_time = time.time() - start_time
@@ -287,7 +317,7 @@ def validate(model: PatchWiseCLIP, val_loader, args, logger, device: torch.devic
         batch_texts = texts[i:i+batch_size]
         proc_out = model.processor(text=batch_texts, **processor_kwargs).to(device)
         
-        txt_pool, txt_latent = model.encode_text(
+        txt_pool, txt_latent = model.module.encode_text(
             input_ids=proc_out["input_ids"],
             attention_mask=proc_out["attention_mask"],
             meta=None,
@@ -330,7 +360,7 @@ def validate(model: PatchWiseCLIP, val_loader, args, logger, device: torch.devic
         pixel_values = pixel_values.to(device, dtype=dtype)
         labels = labels.to(device)
         
-        img_pools, img_patches = model.encode_image(pixel_values)
+        img_pools, img_patches = model.module.encode_image(pixel_values)
         img_pools = F.normalize(img_pools, dim=-1)
         img_patches = F.normalize(img_patches, dim=-1)
         
@@ -555,8 +585,8 @@ def main():
     )
     
     total_steps = args.epochs * len(train_loader)
-    scheduler = create_scheduler(optimizer, total_steps, args.warmup_steps, args.min_lr, args.lr)
-    
+    # scheduler = create_scheduler(optimizer, total_steps, args.warmup_steps, args.min_lr, args.lr, local_rank)
+    scheduler = None
     # Load checkpoint if resuming
     start_epoch = 0
     best_accuracy = 0.0

@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import lightning as L
 from transformers import CLIPModel, CLIPProcessor, CLIPConfig
-from .loss import clip_loss
 from .transformer_model import Transformer
 
 # ───────────────────────── building blocks ─────────────────────── #
@@ -13,6 +12,7 @@ class TokenCompressor(nn.Module):
 
     def __init__(self, hidden: int, img_hidden: int, n_tokens: int, layers: int = 1):
         super().__init__()
+        print(f"n_tokens: {n_tokens}, hidden: {hidden}, img_hidden: {img_hidden}, layers: {layers}")
         self.register = nn.Parameter(torch.randn(n_tokens, hidden) * 0.02)
         self.encoder = Transformer(
             hidden_size=hidden,
@@ -26,9 +26,10 @@ class TokenCompressor(nn.Module):
     def forward(self, txt_hidden: torch.Tensor, mask: torch.Tensor, meta: torch.Tensor):
         y = self.register.expand(txt_hidden.size(0), -1, -1)
         mask = torch.cat([mask, torch.ones(mask.size(0), self.register.size(0), device=mask.device)], dim=1)
+        y = torch.cat([txt_hidden, y], dim=1)
         y = self.encoder(y, mask)
         y = self.out_proj(y)
-        return y
+        return y[:, -self.register.size(0):, :]
 
 
 class PatchWiseCLIP(nn.Module):
@@ -40,6 +41,8 @@ class PatchWiseCLIP(nn.Module):
         self.model = CLIPModel(cfg)
         self.proc = CLIPProcessor.from_pretrained(clip_id)
         self.text_compressing_layers = text_compressing_layers
+        self.pool_scale = nn.Parameter(torch.zeros(1))
+        self.patch_scale = nn.Parameter(torch.zeros(1))
 
         if text_compressing_layers > 0:
             v_cfg = self.model.config.vision_config
@@ -83,24 +86,7 @@ class PatchWiseCLIP(nn.Module):
         else:
             compressed_text_features = None
         return pooled, compressed_text_features
-
-    # ------------------------------- loss ---------------------------------- #
-
-    def compute_loss(self, img_pool, txt_pool, img_patch=None, compressed_text_features=None):
-        global_logits = img_pool @ txt_pool.t() * self.model.logit_scale.exp()
-        pool_loss = clip_loss(global_logits)
-
-        if img_patch is None or compressed_text_features is None:
-            return pool_loss, torch.tensor(0.0, device=img_pool.device)
-
-        scale = self.patch_logit_s.exp()  # (N,)
-        patch_sim = (img_patch.unsqueeze(1) * compressed_text_features.unsqueeze(0)).sum(-1) * scale  # (B_img, B_txt, N)
-        patch_logits = patch_sim.sum(-1)  # aggregate over patches → (B_img, B_txt)
-        patch_loss = clip_loss(patch_logits)
-        ctf_sim = (compressed_text_features.unsqueeze(1) * compressed_text_features.unsqueeze(0)).sum(-1).sum(-1)
-        ctf_loss = clip_loss(ctf_sim)
-        return pool_loss, patch_loss, ctf_loss
-
+        
     # ------------------------------- forward -------------------------------- #
 
     def forward(self, *, input_ids, pixel_values, attention_mask=None, position_ids=None, meta_tensor=None, return_loss=False):
