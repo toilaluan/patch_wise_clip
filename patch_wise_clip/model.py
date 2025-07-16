@@ -39,10 +39,10 @@ class PatchWiseCLIP(nn.Module):
         super().__init__()
         cfg = CLIPConfig.from_pretrained(clip_id)
         self.model = CLIPModel(cfg)
-        self.proc = CLIPProcessor.from_pretrained(clip_id)
+        self.processor = CLIPProcessor.from_pretrained(clip_id)
         self.text_compressing_layers = text_compressing_layers
-        self.pool_scale = nn.Parameter(torch.zeros(1))
-        self.patch_scale = nn.Parameter(torch.zeros(1))
+        self.pool_scale = nn.Parameter(torch.tensor(0.07))
+        self.patch_scale = nn.Parameter(torch.tensor(0.07))
 
         if text_compressing_layers > 0:
             v_cfg = self.model.config.vision_config

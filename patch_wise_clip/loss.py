@@ -1,117 +1,104 @@
 import torch
-import torch.distributed as dist
-import time
-import wandb
+import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed.nn
 
-def _contrastive_loss(logits: torch.Tensor) -> torch.Tensor:
-    """Standard contrastive cross‑entropy used in CLIP."""
-    return F.cross_entropy(logits, torch.arange(len(logits), device=logits.device))
-
-
-def clip_loss(sim: torch.Tensor) -> torch.Tensor:
-    return (_contrastive_loss(sim) + _contrastive_loss(sim.t())) / 2.0
-
-
-def siglip_loss(similarity_matrix: torch.Tensor, labels: torch.Tensor, 
-                temperature: float = 1.0, bias: float = 0.0) -> torch.Tensor:
+def _build_global_offsets(local_bs: int, device) -> torch.Tensor:
     """
-    SigLIP loss function optimized for distributed training.
-    
-    This implementation is designed to work with your existing training code
-    where similarity matrices and labels are already computed.
-    
-    Args:
-        similarity_matrix (torch.Tensor): Similarity scores of shape (batch_size, num_targets)
-        labels (torch.Tensor): Boolean tensor of shape (batch_size, num_targets) 
-                              where True indicates positive pairs
-        temperature (float): Temperature parameter for scaling logits
-        bias (float): Bias term added to logits before sigmoid
-        
-    Returns:
-        torch.Tensor: SigLIP loss value
+    All‑gather local batch sizes and compute a global index offset for each worker.
+    Works even with uneven last batches.
     """
-    # Scale similarity scores
-    logits = similarity_matrix / temperature + bias
-    
-    # Convert boolean labels to float for loss computation
-    targets = labels.float()
-    
-    # Compute sigmoid loss
-    # For positive pairs: -log(sigmoid(logits))
-    # For negative pairs: -log(sigmoid(-logits)) = -log(1 - sigmoid(logits))
-    pos_loss = -targets * F.logsigmoid(logits)
-    neg_loss = -(1 - targets) * F.logsigmoid(-logits)
-    
-    loss = pos_loss + neg_loss
-    
-    # Return mean loss across all pairs
-    return loss.mean()
+    if not torch.distributed.is_initialized():
+        return torch.arange(local_bs, device=device)
 
-def calculate_contrastive_loss(img_features, txt_features, labels, loss_fn):
-    """Calculate contrastive loss between image and text features"""
-    similarity = img_features @ txt_features.T
-    return loss_fn(similarity, labels)
+    world = torch.distributed.get_world_size()
+    sizes = torch.tensor([local_bs], device=device)
+    sizes_all = [torch.zeros_like(sizes) for _ in range(world)]
+    torch.distributed.all_gather(sizes_all, sizes)
+    sizes_all = torch.stack(sizes_all).cpu()
+    offset = int(sizes_all[: torch.distributed.get_rank()].sum())
+    return offset + torch.arange(local_bs, device=device)
 
-def calculate_patch_losses(img_patch_features, txt_features, labels, loss_fn):
-    """Calculate average patch-level contrastive losses"""
-    n_patches = img_patch_features.size(1)
-    patch_losses = []
-    
-    for patch_idx in range(n_patches):
-        patch_features = img_patch_features[:, patch_idx]
-        patch_loss = calculate_contrastive_loss(patch_features, txt_features[:, patch_idx], labels, loss_fn)
-        patch_losses.append(patch_loss)
-    
-    return sum(patch_losses) / n_patches
 
-def calculate_distributed_losses(img_pool, img_patch_features, txt_pool, compressed_text_features, 
-                               world_size, rank, device, loss_fn, pool_scale, patch_scale):
-    """Calculate losses for distributed training"""
-    gathered_txt_pool = torch.empty_like(txt_pool.repeat(world_size, 1))
-    gathered_txt_patch_features = torch.empty_like(compressed_text_features.repeat(world_size, 1, 1))
-    # txt_pool: (B, D)
-    # compressed_text_features: (B, N, D)
-    # gathered_txt_pool: (B*world_size, D)
-    # gathered_txt_patch_features: (B*world_size, N, D)
-    # labels: (B*world_size, B)
-    dist.all_gather_into_tensor(gathered_txt_pool, txt_pool)
-    dist.all_gather_into_tensor(gathered_txt_patch_features, compressed_text_features)
-    labels = torch.zeros(img_pool.size(0) * world_size, img_pool.size(0), device=device)
-    device_batch_size = img_pool.size(0)
-    start_idx = rank * device_batch_size
-    end_idx = start_idx + device_batch_size
-    labels[start_idx:end_idx, :] = torch.eye(device_batch_size, device=device)
-    
-    pool_sim = gathered_txt_pool @ img_pool.T # (B*world_size, B)
-    pool_loss = loss_fn(pool_sim * pool_scale.exp(), labels)
-    patch_losses = []
-    for i in range(img_patch_features.size(1)):
-        patch_sim = gathered_txt_patch_features[:, i, :] @ img_patch_features[:, i, :].T # (B*world_size, B)
-        patch_losses.append(loss_fn(patch_sim * patch_scale.exp(), labels))
-    patch_loss = sum(patch_losses) / img_patch_features.size(1)
-    return pool_loss, patch_loss
+class CLIPLoss(nn.Module):
+    """
+    Contrastive loss used by OpenAI CLIP but with:
+    * gradient‑supporting all_gather (torch.distributed.nn)
+    * uneven‑batch‑size safety
+    """
 
-def calculate_local_losses(img_pool, img_patch_features, txt_pool, compressed_text_features, pool_scale, patch_scale):
-    pool_sim = txt_pool @ img_pool.T # (B, B)
-    pool_loss = clip_loss(pool_sim * pool_scale.exp())
-    patch_losses = []
-    for i in range(img_patch_features.size(1)):
-        patch_sim = compressed_text_features[:, i, :] @ img_patch_features[:, i, :].T # (B, B)
-        patch_losses.append(clip_loss(patch_sim * patch_scale.exp()))
-    patch_loss = sum(patch_losses) / img_patch_features.size(1)
-    return pool_loss, patch_loss
+    def __init__(self):
+        super().__init__()
+        self.cached_bs = None
+        self.cached_global_bs = None
+        self.register_buffer("labels", torch.empty(0, dtype=torch.long), persistent=False)
 
-class LossCalculator:
-    """Encapsulates loss calculation logic for cleaner code organization"""
-    
-    def __init__(self, world_size=1, rank=0):
-        self.world_size = world_size
-        self.rank = rank
-        self.is_distributed = world_size > 1
-    
-    def calculate_losses(self, img_pool, img_patch_features, txt_pool, compressed_text_features, device, pool_scale, patch_scale):
-        return calculate_local_losses(
-            img_pool, img_patch_features, txt_pool, compressed_text_features,
-            pool_scale, patch_scale
+    def _maybe_refresh_labels(self, local_bs, global_bs, device):
+        if (local_bs != self.cached_bs) or (global_bs != self.cached_global_bs):
+            self.labels = _build_global_offsets(local_bs, device)
+            self.cached_bs, self.cached_global_bs = local_bs, global_bs
+
+    def forward(self, img, txt, logit_scale):
+        # normalise
+        img = F.normalize(img, dim=-1)
+        txt = F.normalize(txt, dim=-1)
+
+        # distributed gather
+        if torch.distributed.is_initialized():
+            img_all = torch.cat(torch.distributed.nn.all_gather(img), dim=0)
+            txt_all = torch.cat(torch.distributed.nn.all_gather(txt), dim=0)
+            global_bs = img_all.size(0)
+        else:
+            img_all, txt_all, global_bs = img, txt, img.size(0)
+
+        local_bs = img.size(0)
+        self._maybe_refresh_labels(local_bs, global_bs, img.device)
+
+        # logits
+        logits_per_image = logit_scale * img @ txt_all.t()
+        logits_per_text  = logit_scale * txt @ img_all.t()
+
+        loss = 0.5 * (
+            F.cross_entropy(logits_per_image, self.labels) +
+            F.cross_entropy(logits_per_text,  self.labels)
         )
+
+        with torch.no_grad():
+            correct = (logits_per_image.argmax(dim=-1) == self.labels).sum()
+            acc = correct.float() / local_bs * 100
+
+        return loss, acc
+
+
+class LossCalculator(nn.Module):
+    """
+    Computes:
+      • global/pool‑level CLIP loss
+      • patch‑level loss averaged over all patches
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.clip_loss = CLIPLoss()
+
+    def forward(
+        self,
+        img_pool,                    # (B, D)
+        img_patch_feats,             # (B, P, D)
+        txt_pool,                    # (B, D)
+        txt_compressed_feats,        # (B, P, D)
+        pool_scale, patch_scale
+    ):
+        pool_loss, pool_acc = self.clip_loss(img_pool, txt_pool, pool_scale)
+
+        # Flatten patches so we gather only once
+        B, P, D = img_patch_feats.shape
+        total_patch_loss = 0.0
+        for i in range(P):
+            img_flat = img_patch_feats[:, i, :]
+            txt_flat = txt_compressed_feats[:, i, :]
+            patch_loss, _ = self.clip_loss(img_flat, txt_flat, patch_scale)
+            total_patch_loss += patch_loss
+        patch_loss = total_patch_loss / P  # average over patches
+
+        return pool_loss, patch_loss, pool_acc
