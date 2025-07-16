@@ -55,8 +55,8 @@ class CLIPLoss(nn.Module):
         self._maybe_refresh_labels(local_bs, global_bs, img.device)
 
         # logits
-        logits_per_image = logit_scale * img @ txt_all.t()
-        logits_per_text  = logit_scale * txt @ img_all.t()
+        logits_per_image = logit_scale.exp() * img @ txt_all.t()
+        logits_per_text  = logit_scale.exp() * txt @ img_all.t()
 
         loss = 0.5 * (
             F.cross_entropy(logits_per_image, self.labels) +
