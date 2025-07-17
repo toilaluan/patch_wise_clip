@@ -226,11 +226,6 @@ def validate(model, val_loader, args, logger, device, dtype, epoch):
     txt_pools = txt_pools.view(num_cls, num_tmpl, -1).mean(1)
     txt_latents = txt_latents.view(num_cls, num_tmpl, txt_latents.size(-2), txt_latents.size(-1)).mean(1)
 
-    # Gather across ranks BEFORE normalization
-    if args.world_size > 1:
-        dist.all_reduce(txt_pools, op=dist.ReduceOp.AVG)
-        dist.all_reduce(txt_latents, op=dist.ReduceOp.AVG)
-
     # Normalize AFTER gathering
     txt_pools = F.normalize(txt_pools, dim=-1)
     txt_latents = F.normalize(txt_latents, dim=-1)
@@ -363,7 +358,7 @@ def main():
 
     # optimizer & scheduler
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.98)
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.98), eps=1e-8
     )
 
     total_steps = args.epochs * len(train_loader) // args.grad_accum_steps
