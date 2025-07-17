@@ -1,0 +1,1 @@
+torchrun --nproc_per_node 8 --nnodes 1 --standalone train.py --batch_size 128 --lr 1e-3 --epochs 40 --text_compressing_layers 4 --grad_clip 0 --loss_weights 1.0,0,0 --training_dtype fp32 --warmup_steps 2000 --weight_decay 0.5 --clip_id "openai/clip-vit-base-patch16"
