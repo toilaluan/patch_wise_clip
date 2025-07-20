@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed.nn
 
+
 def _build_global_offsets(local_bs: int, device) -> torch.Tensor:
     """
     All‑gather local batch sizes and compute a global index offset for each worker.
@@ -31,7 +32,9 @@ class CLIPLoss(nn.Module):
         super().__init__()
         self.cached_bs = None
         self.cached_global_bs = None
-        self.register_buffer("labels", torch.empty(0, dtype=torch.long), persistent=False)
+        self.register_buffer(
+            "labels", torch.empty(0, dtype=torch.long), persistent=False
+        )
 
     def _maybe_refresh_labels(self, local_bs, global_bs, device):
         if (local_bs != self.cached_bs) or (global_bs != self.cached_global_bs):
@@ -40,8 +43,8 @@ class CLIPLoss(nn.Module):
 
     def forward(self, img, txt, logit_scale):
         # normalise
-        img = F.normalize(img, dim=-1)
-        txt = F.normalize(txt, dim=-1)
+        img = F.normalize(img, dim=-1, p=2)
+        txt = F.normalize(txt, dim=-1, p=2)
 
         # distributed gather
         if torch.distributed.is_initialized():
@@ -56,11 +59,11 @@ class CLIPLoss(nn.Module):
 
         # logits
         logits_per_image = logit_scale.exp() * img @ txt_all.t()
-        logits_per_text  = logit_scale.exp() * txt @ img_all.t()
+        logits_per_text = logit_scale.exp() * txt @ img_all.t()
 
         loss = 0.5 * (
-            F.cross_entropy(logits_per_image, self.labels) +
-            F.cross_entropy(logits_per_text,  self.labels)
+            F.cross_entropy(logits_per_image, self.labels)
+            + F.cross_entropy(logits_per_text, self.labels)
         )
 
         with torch.no_grad():
@@ -83,22 +86,26 @@ class LossCalculator(nn.Module):
 
     def forward(
         self,
-        img_pool,                    # (B, D)
-        img_patch_feats,             # (B, P, D)
-        txt_pool,                    # (B, D)
-        txt_compressed_feats,        # (B, P, D)
-        pool_scale, patch_scale
+        img_pool,  # (B, D)
+        img_patch_feats,  # (B, P, D)
+        txt_pool,  # (B, D)
+        txt_compressed_feats,  # (B, P, D)
+        pool_scale,
+        patch_scale,
     ):
         pool_loss, pool_acc = self.clip_loss(img_pool, txt_pool, pool_scale)
 
         # Flatten patches so we gather only once
         B, P, D = img_patch_feats.shape
-        total_patch_loss = 0.0
-        for i in range(P):
-            img_flat = img_patch_feats[:, i, :]
-            txt_flat = txt_compressed_feats[:, i, :]
-            patch_loss, _ = self.clip_loss(img_flat, txt_flat, patch_scale)
-            total_patch_loss += patch_loss
-        patch_loss = total_patch_loss / P  # average over patches
+        if txt_compressed_feats is not None:
+            total_patch_loss = 0.0
+            for i in range(P):
+                img_flat = img_patch_feats[:, i, :]
+                txt_flat = txt_compressed_feats[:, i, :]
+                patch_loss, _ = self.clip_loss(img_flat, txt_flat, patch_scale)
+                total_patch_loss += patch_loss
+            patch_loss = total_patch_loss / P  # average over patches
+        else:
+            patch_loss = 0.0
 
         return pool_loss, patch_loss, pool_acc

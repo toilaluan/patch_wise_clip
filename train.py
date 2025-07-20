@@ -37,6 +37,15 @@ from patch_wise_clip.zeroshot_metadata import (
 )
 
 
+def get_model(model):
+    if isinstance(model, torch.nn.DataParallel) or isinstance(
+        model, torch.nn.parallel.DistributedDataParallel
+    ):
+        return get_model(model)
+    else:
+        return model
+
+
 # --------------------------------------------------------------------------- #
 # 1.  Logging & distributed helpers
 # --------------------------------------------------------------------------- #
@@ -112,7 +121,7 @@ def save_checkpoint(
     state = {
         "epoch": epoch,
         "model": (
-            model.module.state_dict()
+            get_model(model).state_dict()
             if hasattr(model, "module")
             else model.state_dict()
         ),
@@ -160,6 +169,7 @@ def train_one_epoch(
     model.train()
     loss_calc = LossCalculator()
     pool_w, patch_w = map(float, args.loss_weights.split(",")[:2])
+    logger.info(f"Pool weight: {pool_w}, Patch weight: {patch_w}")
 
     metrics = {"loss": 0.0, "pl": 0.0, "pt": 0.0, "batches": 0, "acc": 0.0}
 
@@ -167,34 +177,36 @@ def train_one_epoch(
         tqdm(train_loader, desc=f"E{epoch}", disable=args.rank != 0)
     ):
         pixel, ids, mask, meta = (t.to(device, non_blocking=True) for t in batch)
-        pixel = pixel.to(dtype)
         ids, mask = ids.long(), mask.bool()
-        meta = meta.to(dtype)
 
         with autocast(dtype=dtype, device_type="cuda"):
-            img_pool, img_patch = model.module.encode_image(pixel)
-            txt_pool, txt_patch = model.module.encode_text(ids, mask, meta=meta)
+            out = model(
+                input_ids=ids,
+                pixel_values=pixel,
+                attention_mask=mask,
+                meta_tensor=meta,
+            )
             pl, pt, acc = loss_calc(
-                img_pool,
-                img_patch,
-                txt_pool,
-                txt_patch,
-                model.module.pool_scale,
-                model.module.patch_scale,
+                out["image_pooled"],
+                out["image_patches"],
+                out["text_pooled"],
+                out["text_latents"],
+                get_model(model).pool_scale,
+                get_model(model).patch_scale,
             )
             loss = pool_w * pl + patch_w * pt
 
         scaler.scale(loss / accum_steps).backward()
 
         if (step + 1) % accum_steps == 0:
-            if args.grad_clip > 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
-            optimizer.zero_grad()
+            model.zero_grad(set_to_none=True)
             if scheduler is not None:
                 scheduler.step()
+
+        get_model(model).patch_scale.data.clamp_(0, 4.6052)
+        get_model(model).pool_scale.data.clamp_(0, 4.6052)
 
         metrics["loss"] += loss.item()
         metrics["pl"] += pl.item()
@@ -218,8 +230,8 @@ def train_one_epoch(
                         "train/patch_loss": pt.item(),
                         "train/lr": lr,
                         "train/acc": acc.item(),
-                        "train/pool_scale": model.module.pool_scale.item(),
-                        "train/patch_scale": model.module.patch_scale.item(),
+                        "train/pool_scale": get_model(model).pool_scale.item(),
+                        "train/patch_scale": get_model(model).patch_scale.item(),
                     },
                     step=epoch * len(train_loader) + step,
                 )
@@ -244,14 +256,18 @@ def validate(model, val_loader, args, logger, device, dtype, epoch):
         range(0, len(texts), batch_size), desc="Text", disable=args.rank != 0
     ):
         batch = texts[i : i + batch_size]
-        proc = model.module.processor(
-            text=batch,
-            padding=True,
-            truncation=True,
-            max_length=77,
-            return_tensors="pt",
-        ).to(device)
-        pool, latent = model.module.encode_text(
+        proc = (
+            get_model(model)
+            .processor(
+                text=batch,
+                padding=True,
+                truncation=True,
+                max_length=77,
+                return_tensors="pt",
+            )
+            .to(device)
+        )
+        pool, latent = get_model(model).encode_text(
             proc["input_ids"], proc["attention_mask"]
         )
         txt_pools.append(pool)
@@ -265,17 +281,15 @@ def validate(model, val_loader, args, logger, device, dtype, epoch):
     txt_latents = txt_latents.view(
         num_cls, num_tmpl, txt_latents.size(-2), txt_latents.size(-1)
     ).mean(1)
-
-    # Normalize AFTER gathering
-    txt_pools = F.normalize(txt_pools, dim=-1)
-    txt_latents = F.normalize(txt_latents, dim=-1)
+    txt_pools = F.normalize(txt_pools, dim=-1, p=2)
+    txt_latents = F.normalize(txt_latents, dim=-1, p=2)
 
     pool_corr = patch_corr = total = 0
     for pixel, label, _ in tqdm(val_loader, desc="Val", disable=args.rank != 0):
         pixel, label = pixel.to(device, dtype=dtype), label.to(device)
-        img_pool, img_patch = model.module.encode_image(pixel)
-        img_pool = F.normalize(img_pool, dim=-1)
-        img_patch = F.normalize(img_patch, dim=-1)
+        img_pool, img_patch = get_model(model).encode_image(pixel)
+        img_pool = F.normalize(img_pool, dim=-1, p=2)
+        img_patch = F.normalize(img_patch, dim=-1, p=2)
 
         # pool prediction
         pool_pred = torch.argmax(img_pool @ txt_pools.T, dim=-1)
@@ -291,6 +305,10 @@ def validate(model, val_loader, args, logger, device, dtype, epoch):
         patch_pred = torch.tensor(patch_pred, device=label.device)
         patch_corr += (patch_pred == label).sum().item()
         total += label.size(0)
+
+    logger.info(
+        f"[Rank {args.rank}] Pool acc={pool_corr / total:.4f} Patch acc={patch_corr / total:.4f}"
+    )
 
     if args.world_size > 1:
         tensors = torch.tensor([pool_corr, patch_corr, total], device=device)

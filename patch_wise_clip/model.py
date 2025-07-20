@@ -138,16 +138,11 @@ class PatchWiseCLIP(nn.Module):
         attention_mask=None,
         position_ids=None,
         meta_tensor=None,
-        return_loss=False,
     ):
         img_pool, img_patch = self.encode_image(pixel_values)
         txt_pool, compressed_text_features = self.encode_text(
             input_ids, attention_mask, position_ids, meta_tensor
         )
-        if return_loss:
-            return self.compute_loss(
-                img_pool, txt_pool, img_patch, compressed_text_features
-            )
         return {
             "text_pooled": txt_pool,
             "text_latents": compressed_text_features,
