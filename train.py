@@ -23,6 +23,7 @@ from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from torchvision import transforms
 from transformers import AutoProcessor
 from tqdm import tqdm
 
@@ -30,7 +31,11 @@ import wandb
 from patch_wise_clip.data import ClipDataset, ImageNetDataset
 from patch_wise_clip.loss import LossCalculator
 from patch_wise_clip.model import PatchWiseCLIP
-from patch_wise_clip.zeroshot_metadata import IMAGENET_CLASSNAMES, SIMPLE_IMAGENET_TEMPLATES
+from patch_wise_clip.zeroshot_metadata import (
+    IMAGENET_CLASSNAMES,
+    SIMPLE_IMAGENET_TEMPLATES,
+)
+
 
 # --------------------------------------------------------------------------- #
 # 1.  Logging & distributed helpers
@@ -43,7 +48,11 @@ def setup_logging(rank: int, log_dir: Path):
         format=fmt,
         handlers=[
             logging.StreamHandler(),
-            logging.FileHandler(log_dir / "train.log") if rank == 0 else logging.NullHandler(),
+            (
+                logging.FileHandler(log_dir / "train.log")
+                if rank == 0
+                else logging.NullHandler()
+            ),
         ],
     )
     logger = logging.getLogger()
@@ -81,8 +90,12 @@ def get_cosine_schedule_with_warmup(
     def lr_lambda(step: int):
         if step < num_warmup_steps:
             return float(step) / float(max(1, num_warmup_steps))
-        progress = (step - num_warmup_steps) / max(1, num_training_steps - num_warmup_steps)
-        return min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+        progress = (step - num_warmup_steps) / max(
+            1, num_training_steps - num_warmup_steps
+        )
+        return min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (
+            1 + math.cos(math.pi * progress)
+        )
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -98,7 +111,11 @@ def save_checkpoint(
         return
     state = {
         "epoch": epoch,
-        "model": model.module.state_dict() if hasattr(model, "module") else model.state_dict(),
+        "model": (
+            model.module.state_dict()
+            if hasattr(model, "module")
+            else model.state_dict()
+        ),
         "optimizer": optimizer.state_dict(),
         "best_acc": best_acc,
         "args": vars(args),
@@ -146,7 +163,9 @@ def train_one_epoch(
 
     metrics = {"loss": 0.0, "pl": 0.0, "pt": 0.0, "batches": 0, "acc": 0.0}
 
-    for step, batch in enumerate(tqdm(train_loader, desc=f"E{epoch}", disable=args.rank != 0)):
+    for step, batch in enumerate(
+        tqdm(train_loader, desc=f"E{epoch}", disable=args.rank != 0)
+    ):
         pixel, ids, mask, meta = (t.to(device, non_blocking=True) for t in batch)
         pixel = pixel.to(dtype)
         ids, mask = ids.long(), mask.bool()
@@ -155,7 +174,14 @@ def train_one_epoch(
         with autocast(dtype=dtype, device_type="cuda"):
             img_pool, img_patch = model.module.encode_image(pixel)
             txt_pool, txt_patch = model.module.encode_text(ids, mask, meta=meta)
-            pl, pt, acc = loss_calc(img_pool, img_patch, txt_pool, txt_patch, model.module.pool_scale, model.module.patch_scale)
+            pl, pt, acc = loss_calc(
+                img_pool,
+                img_patch,
+                txt_pool,
+                txt_patch,
+                model.module.pool_scale,
+                model.module.patch_scale,
+            )
             loss = pool_w * pl + patch_w * pt
 
         scaler.scale(loss / accum_steps).backward()
@@ -176,7 +202,9 @@ def train_one_epoch(
         metrics["acc"] += acc.item()
         metrics["batches"] += 1
 
-        if (step % args.log_interval == 0 or step == len(train_loader) - 1) and args.rank == 0:
+        if (
+            step % args.log_interval == 0 or step == len(train_loader) - 1
+        ) and args.rank == 0:
             lr = optimizer.param_groups[0]["lr"]
             logger.info(
                 f"E{epoch}S{step:05d}| loss={loss.item():.4f} "
@@ -209,13 +237,23 @@ def validate(model, val_loader, args, logger, device, dtype, epoch):
     # Build text features once (all templates)
     templates = SIMPLE_IMAGENET_TEMPLATES
     texts = [t(c) for c in IMAGENET_CLASSNAMES for t in templates]
-    batch_size = 1024*8
+    batch_size = 1024 * 8
     txt_pools, txt_latents = [], []
 
-    for i in tqdm(range(0, len(texts), batch_size), desc="Text", disable=args.rank != 0):
+    for i in tqdm(
+        range(0, len(texts), batch_size), desc="Text", disable=args.rank != 0
+    ):
         batch = texts[i : i + batch_size]
-        proc = model.module.processor(text=batch, padding=True, truncation=True, max_length=77, return_tensors="pt").to(device)
-        pool, latent = model.module.encode_text(proc["input_ids"], proc["attention_mask"])
+        proc = model.module.processor(
+            text=batch,
+            padding=True,
+            truncation=True,
+            max_length=77,
+            return_tensors="pt",
+        ).to(device)
+        pool, latent = model.module.encode_text(
+            proc["input_ids"], proc["attention_mask"]
+        )
         txt_pools.append(pool)
         txt_latents.append(latent)
 
@@ -224,7 +262,9 @@ def validate(model, val_loader, args, logger, device, dtype, epoch):
 
     num_cls, num_tmpl = len(IMAGENET_CLASSNAMES), len(templates)
     txt_pools = txt_pools.view(num_cls, num_tmpl, -1).mean(1)
-    txt_latents = txt_latents.view(num_cls, num_tmpl, txt_latents.size(-2), txt_latents.size(-1)).mean(1)
+    txt_latents = txt_latents.view(
+        num_cls, num_tmpl, txt_latents.size(-2), txt_latents.size(-1)
+    ).mean(1)
 
     # Normalize AFTER gathering
     txt_pools = F.normalize(txt_pools, dim=-1)
@@ -261,13 +301,15 @@ def validate(model, val_loader, args, logger, device, dtype, epoch):
     patch_acc = patch_corr / total
     logger.info(f"Pool acc={pool_acc:.4f}  Patch acc={patch_acc:.4f}")
     if not args.disable_wandb and args.rank == 0:
-        wandb.log({
-            "val/pool_acc": pool_acc,
-            "val/pool_corr": pool_corr,
-            "val/patch_corr": patch_corr,
-            "val/total": total,
-            "val/patch_acc": patch_acc,
-        })
+        wandb.log(
+            {
+                "val/pool_acc": pool_acc,
+                "val/pool_corr": pool_corr,
+                "val/patch_corr": patch_corr,
+                "val/total": total,
+                "val/patch_acc": patch_acc,
+            }
+        )
     return pool_acc, patch_acc
 
 
@@ -327,8 +369,27 @@ def main():
     dtype_map = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
     dtype = dtype_map[args.training_dtype]
 
-    train_ds = ClipDataset(pretrained_clip_id=args.clip_id)
-    val_ds = ImageNetDataset(pretrained_clip_id=args.clip_id)
+    normalize = transforms.Normalize(
+        mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+    )
+    train_transform = transforms.Compose(
+        [
+            transforms.RandomResizedCrop(224, scale=(0.5, 1.0)),
+            transforms.ToTensor(),
+            normalize,
+        ]
+    )
+    val_transform = transforms.Compose(
+        [
+            transforms.Resize(224),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            normalize,
+        ]
+    )
+
+    train_ds = ClipDataset(pretrained_clip_id=args.clip_id, transform=train_transform)
+    val_ds = ImageNetDataset(pretrained_clip_id=args.clip_id, transform=val_transform)
 
     train_sampler = DistributedSampler(train_ds) if world_size > 1 else None
     val_sampler = DistributedSampler(val_ds, shuffle=False) if world_size > 1 else None
@@ -351,14 +412,20 @@ def main():
     )
 
     # model
-    model = PatchWiseCLIP(clip_id=args.clip_id, text_compressing_layers=args.text_compressing_layers)
+    model = PatchWiseCLIP(
+        clip_id=args.clip_id, text_compressing_layers=args.text_compressing_layers
+    )
     model.to(device, dtype=dtype)
     if world_size > 1:
         model = DDP(model, device_ids=[local_rank])
 
     # optimizer & scheduler
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.98), eps=1e-8
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        betas=(0.9, 0.98),
+        eps=1e-8,
     )
 
     total_steps = args.epochs * len(train_loader) // args.grad_accum_steps
@@ -368,14 +435,18 @@ def main():
     # resume
     start_epoch, best_acc = 0, 0.0
     if args.resume:
-        start_epoch, best_acc = load_checkpoint(args.resume, model, optimizer, scheduler, device)
+        start_epoch, best_acc = load_checkpoint(
+            args.resume, model, optimizer, scheduler, device
+        )
         logger.info(f"Resumed from epoch {start_epoch}, best_acc={best_acc:.4f}")
 
     # scaler for AMP
     scaler = GradScaler(enabled=(dtype == torch.float16))
 
     # training loop
-    logger.info(f"Start training for {args.epochs} epochs, {total_steps} steps, world_size={world_size}")
+    logger.info(
+        f"Start training for {args.epochs} epochs, {total_steps} steps, world_size={world_size}"
+    )
     for epoch in range(start_epoch, args.epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -395,7 +466,9 @@ def main():
         )
 
         if (epoch + 1) % args.eval_interval == 0 or epoch == args.epochs - 1:
-            pool_acc, patch_acc = validate(model, val_loader, args, logger, device, dtype, epoch)
+            pool_acc, patch_acc = validate(
+                model, val_loader, args, logger, device, dtype, epoch
+            )
             curr_acc = max(pool_acc, patch_acc)
             is_best = curr_acc > best_acc
             if is_best:
