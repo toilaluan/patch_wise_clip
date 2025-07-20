@@ -25,7 +25,7 @@ class ClipDataset(Dataset):
             print(f"Error at index {index}: {e}")
             return self.__getitem__(random.randint(0, len(self.ds)))
 
-        image = x["jpg"]
+        image = x["jpg"].convert("RGB")
         width, height = image.size
         ratio = width / height
         scale = math.sqrt(width * height / (self.target_size**2))
@@ -48,7 +48,7 @@ class ImageNetDataset(Dataset):
 
     def __init__(self, pretrained_clip_id: str, transform=None):
         self.ds = load_dataset("timm/imagenet-1k-wds", split="validation", num_proc=32)
-        self.target = self.proc.size["shortest_edge"]
+        self.target = 224
         self.transform = transform
 
     def __len__(self):

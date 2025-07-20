@@ -106,6 +106,6 @@ class LossCalculator(nn.Module):
                 total_patch_loss += patch_loss
             patch_loss = total_patch_loss / P  # average over patches
         else:
-            patch_loss = 0.0
+            patch_loss = torch.tensor(0.0)
 
         return pool_loss, patch_loss, pool_acc

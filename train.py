@@ -41,7 +41,7 @@ def get_model(model):
     if isinstance(model, torch.nn.DataParallel) or isinstance(
         model, torch.nn.parallel.DistributedDataParallel
     ):
-        return get_model(model)
+        return model.module
     else:
         return model
 
@@ -180,17 +180,21 @@ def train_one_epoch(
         ids, mask = ids.long(), mask.bool()
 
         with autocast(dtype=dtype, device_type="cuda"):
-            out = model(
-                input_ids=ids,
-                pixel_values=pixel,
-                attention_mask=mask,
-                meta_tensor=meta,
+            # txt_pool, compressed_text_features, img_pool, img_patch = model(
+            #     input_ids=ids,
+            #     pixel_values=pixel,
+            #     attention_mask=mask,
+            #     meta_tensor=meta,
+            # )
+            img_pool, img_patch = get_model(model).encode_image(pixel)
+            txt_pool, compressed_text_features = get_model(model).encode_text(
+                ids, mask, meta=meta
             )
             pl, pt, acc = loss_calc(
-                out["image_pooled"],
-                out["image_patches"],
-                out["text_pooled"],
-                out["text_latents"],
+                img_pool,
+                img_patch,
+                txt_pool,
+                compressed_text_features,
                 get_model(model).pool_scale,
                 get_model(model).patch_scale,
             )
@@ -201,7 +205,7 @@ def train_one_epoch(
         if (step + 1) % accum_steps == 0:
             scaler.step(optimizer)
             scaler.update()
-            model.zero_grad(set_to_none=True)
+            optimizer.zero_grad(set_to_none=True)
             if scheduler is not None:
                 scheduler.step()
 
@@ -273,16 +277,17 @@ def validate(model, val_loader, args, logger, device, dtype, epoch):
         txt_pools.append(pool)
         txt_latents.append(latent)
 
-    txt_pools = torch.cat(txt_pools)
-    txt_latents = torch.cat(txt_latents)
-
     num_cls, num_tmpl = len(IMAGENET_CLASSNAMES), len(templates)
+    txt_pools = torch.cat(txt_pools)
     txt_pools = txt_pools.view(num_cls, num_tmpl, -1).mean(1)
-    txt_latents = txt_latents.view(
-        num_cls, num_tmpl, txt_latents.size(-2), txt_latents.size(-1)
-    ).mean(1)
     txt_pools = F.normalize(txt_pools, dim=-1, p=2)
-    txt_latents = F.normalize(txt_latents, dim=-1, p=2)
+
+    if txt_latents:
+        txt_latents = torch.cat(txt_latents)
+        txt_latents = txt_latents.view(
+            num_cls, num_tmpl, txt_latents.size(-2), txt_latents.size(-1)
+        ).mean(1)
+        txt_latents = F.normalize(txt_latents, dim=-1, p=2)
 
     pool_corr = patch_corr = total = 0
     for pixel, label, _ in tqdm(val_loader, desc="Val", disable=args.rank != 0):
@@ -296,14 +301,17 @@ def validate(model, val_loader, args, logger, device, dtype, epoch):
         pool_corr += (pool_pred == label).sum().item()
 
         # patch voting
-        B, N, D = img_patch.shape
-        patch_pred = []
-        for b in range(B):
-            sim = torch.sum(img_patch[b].unsqueeze(0) * txt_latents, dim=-1)  # (C, N)
-            votes = torch.bincount(torch.argmax(sim, dim=0), minlength=num_cls)
-            patch_pred.append(votes.argmax())
-        patch_pred = torch.tensor(patch_pred, device=label.device)
-        patch_corr += (patch_pred == label).sum().item()
+        if txt_latents:
+            B, N, D = img_patch.shape
+            patch_pred = []
+            for b in range(B):
+                sim = torch.sum(img_patch[b].unsqueeze(0) * txt_latents, dim=-1)  # (C, N)
+                votes = torch.bincount(torch.argmax(sim, dim=0), minlength=num_cls)
+                patch_pred.append(votes.argmax())
+            patch_pred = torch.tensor(patch_pred, device=label.device)
+            patch_corr += (patch_pred == label).sum().item()
+        else:
+            patch_corr += 0
         total += label.size(0)
 
     logger.info(
@@ -416,26 +424,29 @@ def main():
         train_ds,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        pin_memory=args.pin_memory,
+        pin_memory=True,
         sampler=train_sampler,
-        shuffle=train_sampler is None,
         drop_last=True,
+        persistent_workers=True,
+        prefetch_factor=4,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=args.batch_size * 2,
         num_workers=args.num_workers,
-        pin_memory=args.pin_memory,
+        pin_memory=True,
         sampler=val_sampler,
+        persistent_workers=True,
+        prefetch_factor=4,
     )
 
     # model
     model = PatchWiseCLIP(
         clip_id=args.clip_id, text_compressing_layers=args.text_compressing_layers
     )
-    model.to(device, dtype=dtype)
+    model.to(device)
     if world_size > 1:
-        model = DDP(model, device_ids=[local_rank])
+        model = DDP(model, device_ids=[local_rank], gradient_as_bucket_view=True, static_graph=True)
 
     # optimizer & scheduler
     optimizer = torch.optim.AdamW(

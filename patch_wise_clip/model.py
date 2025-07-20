@@ -143,9 +143,4 @@ class PatchWiseCLIP(nn.Module):
         txt_pool, compressed_text_features = self.encode_text(
             input_ids, attention_mask, position_ids, meta_tensor
         )
-        return {
-            "text_pooled": txt_pool,
-            "text_latents": compressed_text_features,
-            "image_pooled": img_pool,
-            "image_patches": img_patch,
-        }
+        return txt_pool, compressed_text_features, img_pool, img_patch
