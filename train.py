@@ -168,8 +168,8 @@ def train_one_epoch(
 ):
     model.train()
     loss_calc = LossCalculator()
-    pool_w, patch_w = map(float, args.loss_weights.split(",")[:2])
-    logger.info(f"Pool weight: {pool_w}, Patch weight: {patch_w}")
+    pool_w, patch_w, patch_diversity_w = map(float, args.loss_weights.split(",")[:3])
+    logger.info(f"Pool weight: {pool_w}, Patch weight: {patch_w}, Patch diversity weight: {patch_diversity_w}")
 
     metrics = {"loss": 0.0, "pl": 0.0, "pt": 0.0, "batches": 0, "acc": 0.0}
 
@@ -190,15 +190,16 @@ def train_one_epoch(
             txt_pool, compressed_text_features = get_model(model).encode_text(
                 ids, mask, meta=meta
             )
-            pl, pt, acc = loss_calc(
+            pl, pt, acc, img_patch_diversity, img_patch_similarity = loss_calc(
                 img_pool,
                 img_patch,
                 txt_pool,
                 compressed_text_features,
                 get_model(model).pool_scale,
                 get_model(model).patch_scale,
+                get_model(model).patch_diversity_scale,
             )
-            loss = pool_w * pl + patch_w * pt
+            loss = pool_w * pl + patch_w * pt + patch_diversity_w * img_patch_diversity
 
         scaler.scale(loss / accum_steps).backward()
 
@@ -221,10 +222,11 @@ def train_one_epoch(
         if (
             step % args.log_interval == 0 or step == len(train_loader) - 1
         ) and args.rank == 0:
+
             lr = optimizer.param_groups[0]["lr"]
             logger.info(
                 f"E{epoch}S{step:05d}| loss={loss.item():.4f} "
-                f"pl={pl.item():.4f} pt={pt.item():.4f} lr={lr:.2e}"
+                f"pl={pl.item():.4f} pt={pt.item():.4f} lr={lr:.2e} img_patch_diversity={img_patch_diversity.item():.4f}"
             )
             if not args.disable_wandb:
                 wandb.log(
@@ -236,6 +238,7 @@ def train_one_epoch(
                         "train/acc": acc.item(),
                         "train/pool_scale": get_model(model).pool_scale.item(),
                         "train/patch_scale": get_model(model).patch_scale.item(),
+                        "train/img_patch_diversity": img_patch_diversity.item(),
                     },
                     step=epoch * len(train_loader) + step,
                 )
@@ -253,7 +256,7 @@ def validate(model, val_loader, args, logger, device, dtype, epoch):
     # Build text features once (all templates)
     templates = SIMPLE_IMAGENET_TEMPLATES
     texts = [t(c) for c in IMAGENET_CLASSNAMES for t in templates]
-    batch_size = 1024 * 8
+    batch_size = 1024 * 4
     txt_pools, txt_latents = [], []
 
     for i in tqdm(
@@ -275,7 +278,8 @@ def validate(model, val_loader, args, logger, device, dtype, epoch):
             proc["input_ids"], proc["attention_mask"]
         )
         txt_pools.append(pool)
-        txt_latents.append(latent)
+        if latent is not None:
+            txt_latents.append(latent)
 
     num_cls, num_tmpl = len(IMAGENET_CLASSNAMES), len(templates)
     txt_pools = torch.cat(txt_pools)
@@ -301,7 +305,7 @@ def validate(model, val_loader, args, logger, device, dtype, epoch):
         pool_corr += (pool_pred == label).sum().item()
 
         # patch voting
-        if txt_latents:
+        if isinstance(txt_latents, torch.Tensor):
             B, N, D = img_patch.shape
             patch_pred = []
             for b in range(B):
@@ -445,6 +449,7 @@ def main():
         clip_id=args.clip_id, text_compressing_layers=args.text_compressing_layers
     )
     model.to(device)
+    model = torch.compile(model)
     if world_size > 1:
         model = DDP(model, device_ids=[local_rank], gradient_as_bucket_view=True, static_graph=True)
 

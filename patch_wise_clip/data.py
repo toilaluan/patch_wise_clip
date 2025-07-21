@@ -61,8 +61,9 @@ class ImageNetDataset(Dataset):
             print(f"Error at index {idx}: {e}")
             return self.__getitem__(random.randint(0, len(self.ds)))
 
-        img = self.transform(item["jpg"].convert("RGB"))
+        img = item["jpg"].convert("RGB")
         w, h = img.size
+        img = self.transform(img)
         ratio, scale = w / h, math.sqrt(w * h / (self.target**2))
 
         return img, item["cls"], torch.tensor([ratio, scale])

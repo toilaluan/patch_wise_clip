@@ -65,7 +65,7 @@ class PatchWiseCLIP(nn.Module):
         self.text_compressing_layers = text_compressing_layers
         self.pool_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
         self.patch_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
-
+        self.patch_diversity_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
         if text_compressing_layers > 0:
             v_cfg = self.model.config.vision_config
             grid = v_cfg.image_size // v_cfg.patch_size

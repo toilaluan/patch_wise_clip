@@ -1,10 +1,10 @@
 torchrun --nproc_per_node 8 --nnodes 1 --standalone train.py \
---batch_size 512 \
+--batch_size 256 \
 --lr 2e-4 \
 --epochs 40 \
 --text_compressing_layers 0 \
 --grad_clip 0 \
---loss_weights 1.0,0,0 \
+--loss_weights 1.0,0.0,0.0 \
 --training_dtype bf16 \
 --warmup_steps 2000 \
 --weight_decay 0.2 \

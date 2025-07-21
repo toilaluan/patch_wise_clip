@@ -92,8 +92,15 @@ class LossCalculator(nn.Module):
         txt_compressed_feats,  # (B, P, D)
         pool_scale,
         patch_scale,
+        patch_diversity_scale=1.0,
     ):
         pool_loss, pool_acc = self.clip_loss(img_pool, txt_pool, pool_scale)
+        img_patch_similarity = torch.einsum("bpd,bqd->bpq", img_patch_feats, img_patch_feats)
+        img_patch_diversity = img_patch_similarity * patch_diversity_scale.exp()
+        labels = torch.arange(img_patch_diversity.size(1), device=img_patch_diversity.device)
+        labels = labels.repeat(img_patch_diversity.size(0), 1)
+        img_patch_diversity = F.cross_entropy(img_patch_diversity, labels)
+        img_patch_diversity = img_patch_diversity.mean()
 
         # Flatten patches so we gather only once
         B, P, D = img_patch_feats.shape
@@ -108,4 +115,4 @@ class LossCalculator(nn.Module):
         else:
             patch_loss = torch.tensor(0.0)
 
-        return pool_loss, patch_loss, pool_acc
+        return pool_loss, patch_loss, pool_acc, img_patch_diversity, img_patch_similarity

@@ -22,7 +22,7 @@ class Attention(nn.Module):
         self.q_norm = nn.RMSNorm(hidden_size, eps=1e-5)
         self.k_norm = nn.RMSNorm(hidden_size, eps=1e-5)
 
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, is_causal=False):
         batch_size, seq_len, dim = x.shape
         q = self.to_q(x)
         k = self.to_k(x)
@@ -41,6 +41,8 @@ class Attention(nn.Module):
             mask = mask.unsqueeze(1)  # [batch_size, 1, seq_len, seq_len]
             # Convert to boolean mask (True for positions to attend to)
             mask = mask.bool()
+            if is_causal:
+                mask = mask.tril(diagonal=0)
         
         out = F.scaled_dot_product_attention(
             q, k, v, 
