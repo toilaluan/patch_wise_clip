@@ -69,15 +69,19 @@ class PatchWiseCLIP(nn.Module):
         if text_compressing_layers > 0:
             v_cfg = self.model.config.vision_config
             grid = v_cfg.image_size // v_cfg.patch_size
-            n_patches = grid * grid
+            self.n_patches = grid
+            self.img_patch_compressor = nn.Linear(
+                v_cfg.hidden_size * grid * grid, v_cfg.hidden_size * self.n_patches
+            )
             self.token_compressor = TokenCompressor(
                 hidden=self.model.config.text_config.hidden_size,
                 img_hidden=v_cfg.hidden_size,
-                n_tokens=n_patches,
+                n_tokens=self.n_patches,
                 layers=text_compressing_layers,
             )
-            self.patch_logit_s = nn.Parameter(torch.zeros(n_patches))
+            self.patch_logit_s = nn.Parameter(torch.zeros(self.n_patches))
         else:
+            self.img_patch_compressor = None
             self.token_compressor = None
             self.patch_logit_s = None
 
@@ -92,7 +96,11 @@ class PatchWiseCLIP(nn.Module):
         )
         pooled = self.model.visual_projection(out.pooler_output)
         pooled = pooled / _get_vector_norm(pooled)
-        patches = out.last_hidden_state[:, 1:]  # remove CLS
+        patches = out.last_hidden_state[:, 1:]  # remove CLS, (B, N, D)
+        B, N, D = patches.shape
+        patches = patches.reshape(B, -1)
+        patches = self.img_patch_compressor(patches)
+        patches = patches.reshape(B, self.n_patches, -1)
         patches = patches / _get_vector_norm(patches)
         return pooled, patches  # (B, D), (B, N, D)
 
