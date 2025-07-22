@@ -8,6 +8,7 @@ class Attention(nn.Module):
         hidden_size: int,
         n_heads: int,
         dropout: float = 0.1,
+        max_length: int = 77+196,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -18,15 +19,22 @@ class Attention(nn.Module):
         self.to_k = nn.Linear(hidden_size, hidden_size)
         self.to_v = nn.Linear(hidden_size, hidden_size)
         self.to_out = nn.Linear(hidden_size, hidden_size)
+        self.max_length = max_length
 
         self.q_norm = nn.RMSNorm(hidden_size, eps=1e-5)
         self.k_norm = nn.RMSNorm(hidden_size, eps=1e-5)
+
+        self.position_embeddings = nn.Embedding(max_length, hidden_size)
+        self.position_embeddings.weight.data.normal_(mean=0.0, std=0.02)
 
     def forward(self, x, mask=None, is_causal=False):
         batch_size, seq_len, dim = x.shape
         q = self.to_q(x)
         k = self.to_k(x)
         v = self.to_v(x)
+        position_embeddings = self.position_embeddings(torch.arange(seq_len, device=x.device))
+        q = q + position_embeddings
+        k = k + position_embeddings
         q = self.q_norm(q)
         k = self.k_norm(k)
         q = q.view(q.size(0), -1, self.n_heads, self.head_dim).transpose(1, 2)
